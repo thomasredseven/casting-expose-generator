@@ -22,7 +22,7 @@ st.set_page_config(
 # Gemini API Setup
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+model = genai.GenerativeModel("gemini-2.0-flash")
 
 # --- Prompt für Extraktion ---
 EXTRACTION_PROMPT = """
