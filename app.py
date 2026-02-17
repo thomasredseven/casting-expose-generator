@@ -1,8 +1,11 @@
-# app.py - Casting Exposé Generator v1.1
+# app.py - Casting Exposé Generator v1.2
+# Mit Bildkomprimierung, Retry-Logik und Warte-Dialog
+
 import streamlit as st
 import google.generativeai as genai
 from PIL import Image
 import io
+import time
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
@@ -59,6 +62,25 @@ WICHTIG:
 """
 
 # --- Hilfsfunktionen ---
+
+def compress_image(image, max_size=1024, quality=85):
+    """
+    Komprimiert Bilder um Token zu sparen.
+    Reduziert Auflösung auf max 1024px und optimiert Qualität.
+    """
+    # Größe reduzieren wenn nötig
+    ratio = min(max_size / image.width, max_size / image.height)
+    if ratio < 1:
+        new_size = (int(image.width * ratio), int(image.height * ratio))
+        image = image.resize(new_size, Image.LANCZOS)
+    
+    # In RGB konvertieren falls nötig (für JPEG-Kompatibilität)
+    if image.mode in ('RGBA', 'P'):
+        image = image.convert('RGB')
+    
+    return image
+
+
 def extract_text_from_pdf(pdf_file):
     """Extrahiert Text aus PDF"""
     pdf_bytes = pdf_file.read()
@@ -69,6 +91,7 @@ def extract_text_from_pdf(pdf_file):
     doc.close()
     return text
 
+
 def extract_text_from_docx(docx_file):
     """Extrahiert Text aus Word-Dokument"""
     doc = Document(docx_file)
@@ -77,19 +100,65 @@ def extract_text_from_docx(docx_file):
         text += para.text + "\n"
     return text
 
-def extract_info_from_images(images):
-    """Extrahiert Informationen aus Bildern via Gemini"""
-    contents = [EXTRACTION_PROMPT]
-    for img in images:
-        contents.append(img)
-    response = model.generate_content(contents)
-    return response.text
 
-def extract_info_from_text(text):
-    """Extrahiert Informationen aus Text via Gemini"""
-    prompt = EXTRACTION_PROMPT + "\n\nHier sind die Unterlagen:\n\n" + text
-    response = model.generate_content(prompt)
-    return response.text
+def call_gemini_with_retry(contents, max_retries=3, initial_wait=45):
+    """
+    Ruft Gemini API auf mit automatischem Retry bei Rate-Limit-Fehlern.
+    Zeigt einen Countdown während der Wartezeit.
+    """
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(contents)
+            return response.text
+        
+        except Exception as e:
+            error_message = str(e)
+            
+            # Prüfen ob es ein Rate-Limit-Fehler ist
+            if "429" in error_message or "quota" in error_message.lower() or "rate" in error_message.lower():
+                
+                # Wartezeit aus Fehlermeldung extrahieren oder Standard verwenden
+                wait_time = initial_wait
+                if "retry_delay" in error_message:
+                    try:
+                        # Versuche Wartezeit aus Fehler zu parsen
+                        import re
+                        match = re.search(r'retry_delay.*?(\d+)', error_message)
+                        if match:
+                            wait_time = int(match.group(1)) + 5  # +5 Sekunden Puffer
+                    except:
+                        pass
+                
+                if attempt < max_retries - 1:
+                    # Warte-Dialog mit Countdown anzeigen
+                    st.warning(f"⏳ API-Limit erreicht. Warte {wait_time} Sekunden vor erneutem Versuch... (Versuch {attempt + 1}/{max_retries})")
+                    
+                    # Countdown anzeigen
+                    progress_bar = st.progress(0)
+                    countdown_text = st.empty()
+                    
+                    for i in range(wait_time):
+                        remaining = wait_time - i
+                        countdown_text.text(f"⏱️ Noch {remaining} Sekunden...")
+                        progress_bar.progress((i + 1) / wait_time)
+                        time.sleep(1)
+                    
+                    countdown_text.empty()
+                    progress_bar.empty()
+                    st.info("🔄 Versuche erneut...")
+                else:
+                    # Alle Versuche aufgebraucht
+                    raise Exception(
+                        f"API-Limit auch nach {max_retries} Versuchen noch erreicht. "
+                        f"Bitte warte einige Minuten und versuche es dann erneut, "
+                        f"oder verwende weniger/kleinere Bilder."
+                    )
+            else:
+                # Anderer Fehler - direkt weitergeben
+                raise e
+    
+    return None
+
 
 def extract_info_combined(images, text):
     """Kombiniert Bilder und Text für Extraktion"""
@@ -103,8 +172,25 @@ def extract_info_combined(images, text):
         for img in images:
             contents.append(img)
     
-    response = model.generate_content(contents)
-    return response.text
+    # Mit Retry-Logik aufrufen
+    return call_gemini_with_retry(contents)
+
+
+def extract_info_from_images(images):
+    """Extrahiert Informationen aus Bildern via Gemini"""
+    contents = [EXTRACTION_PROMPT]
+    for img in images:
+        contents.append(img)
+    
+    return call_gemini_with_retry(contents)
+
+
+def extract_info_from_text(text):
+    """Extrahiert Informationen aus Text via Gemini"""
+    prompt = EXTRACTION_PROMPT + "\n\nHier sind die Unterlagen:\n\n" + text
+    
+    return call_gemini_with_retry([prompt])
+
 
 def create_pdf(content, title="Exposé"):
     """Erstellt ein PDF aus dem Markdown-Content"""
@@ -169,6 +255,7 @@ def create_pdf(content, title="Exposé"):
     buffer.seek(0)
     return buffer
 
+
 # --- UI ---
 st.title("🎬 Casting Exposé Generator")
 st.markdown("*Automatische Erstellung von Exposés aus Casting-Unterlagen*")
@@ -198,6 +285,14 @@ with col1:
         st.success(f"✅ {len(uploaded_files)} Datei(en) hochgeladen")
         st.caption(f"📷 {len(image_files)} Bilder | 📄 {len(pdf_files)} PDFs | 📝 {len(docx_files)} Word-Dokumente")
         
+        # Warnung bei vielen Bildern
+        if len(image_files) > 5:
+            st.warning(
+                f"⚠️ {len(image_files)} Bilder hochgeladen. "
+                f"Bilder werden automatisch komprimiert um API-Limits zu vermeiden. "
+                f"Bei Problemen: Versuche es mit weniger Bildern (3-5 reichen meist)."
+            )
+        
         with st.expander("Vorschau Bilder"):
             if image_files:
                 cols = st.columns(min(len(image_files), 3))
@@ -220,6 +315,27 @@ st.divider()
 # --- Schritt 2: Verarbeitung ---
 st.header("2️⃣ Informationen extrahieren")
 
+# Optionen für Bildkomprimierung
+with st.expander("⚙️ Erweiterte Optionen"):
+    col1, col2 = st.columns(2)
+    with col1:
+        max_image_size = st.slider(
+            "Max. Bildgröße (Pixel)",
+            min_value=512,
+            max_value=2048,
+            value=1024,
+            step=256,
+            help="Kleinere Bilder = weniger Token = schneller & günstiger"
+        )
+    with col2:
+        max_retries = st.slider(
+            "Max. Wiederholungsversuche",
+            min_value=1,
+            max_value=5,
+            value=3,
+            help="Wie oft bei API-Limit automatisch erneut versucht werden soll"
+        )
+
 if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True):
     if not uploaded_files and not manual_text:
         st.error("Bitte laden Sie mindestens eine Datei hoch oder geben Sie Text ein.")
@@ -229,22 +345,39 @@ if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True
                 # Text aus PDFs und Word-Dokumenten extrahieren
                 extracted_text = manual_text or ""
                 
-                for f in uploaded_files:
-                    f.seek(0)  # Reset file pointer
-                    if f.type == 'application/pdf':
-                        extracted_text += "\n\n--- PDF-DOKUMENT ---\n" + extract_text_from_pdf(f)
-                    elif f.type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-                        extracted_text += "\n\n--- WORD-DOKUMENT ---\n" + extract_text_from_docx(f)
+                # Status-Updates
+                status = st.empty()
                 
-                # Bilder vorbereiten
-                pil_images = []
+                # PDFs und Word-Dokumente verarbeiten
                 for f in uploaded_files:
                     f.seek(0)
+                    if f.type == 'application/pdf':
+                        status.text(f"📄 Extrahiere Text aus {f.name}...")
+                        extracted_text += "\n\n--- PDF-DOKUMENT ---\n" + extract_text_from_pdf(f)
+                    elif f.type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+                        status.text(f"📝 Extrahiere Text aus {f.name}...")
+                        extracted_text += "\n\n--- WORD-DOKUMENT ---\n" + extract_text_from_docx(f)
+                
+                # Bilder vorbereiten (MIT KOMPRIMIERUNG)
+                pil_images = []
+                image_count = len([f for f in uploaded_files if f.type.startswith('image/')])
+                
+                for i, f in enumerate(uploaded_files):
+                    f.seek(0)
                     if f.type.startswith('image/'):
+                        status.text(f"🖼️ Komprimiere Bild {i+1}/{image_count}: {f.name}...")
                         img = Image.open(f)
+                        
+                        # Komprimierung anwenden
+                        original_size = f"{img.width}x{img.height}"
+                        img = compress_image(img, max_size=max_image_size)
+                        new_size = f"{img.width}x{img.height}"
+                        
                         pil_images.append(img)
                 
-                # Extraktion
+                status.text("🤖 Sende an Gemini API...")
+                
+                # Extraktion mit Retry-Logik
                 if pil_images and extracted_text:
                     result = extract_info_combined(pil_images, extracted_text)
                 elif pil_images:
@@ -252,6 +385,7 @@ if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True
                 else:
                     result = extract_info_from_text(extracted_text)
                 
+                status.empty()
                 st.session_state["extracted_content"] = result
                 st.success("✅ Analyse abgeschlossen!")
                 
