@@ -1,5 +1,5 @@
-# app.py - Casting Exposé Generator v3.1
-# Korrekturen: Modell, Hintergrund, Titel-Position, Foto-Größe, EXIF-Rotation, kürzere Texte
+# app.py - Casting Exposé Generator v3.2
+# Fixes: DIE FAMILIE im PDF, mehr Abstand, Namen fett, Logos im UI
 
 import streamlit as st
 import google.generativeai as genai
@@ -34,7 +34,7 @@ COLORS = {
     'text_dark': (51, 51, 51),
 }
 
-# --- Prompts (kürzer & knackiger) ---
+# --- Prompts ---
 EXTRACTION_PROMPT = """
 Analysiere diese Casting-Unterlagen und erstelle ein KURZES, KNACKIGES Exposé.
 
@@ -64,16 +64,14 @@ NOTIZEN:
 Termine, Einschränkungen, Besonderes (nur wenn relevant)
 
 REGELN:
-- KURZ und KNACKIG, keine langen Sätze
-- Nur das Wesentliche
+- KURZ und KNACKIG
 - Erste Zeile: FAMILIENNAME|||ORT
 - Deutsch
-- Ignoriere Datenschutztexte
 """
 
 SINGLE_IMAGE_PROMPT = """
 Extrahiere die wichtigsten Informationen aus diesem Dokument.
-Kurz und stichpunktartig. Deutsch. Unleserliches: [unleserlich].
+Kurz und stichpunktartig. Deutsch.
 """
 
 COMBINE_PROMPT = """
@@ -96,39 +94,33 @@ FAKTEN ZUM GARTEN:
 BUDGET: X €
 
 WÜNSCHE FÜR DEN GARTEN:
-- Max. 5 Hauptwünsche, kurz
+- Max. 5 Hauptwünsche
 
 DIE FAMILIE:
-1-2 Sätze
+1-2 Sätze zur Familie
 
 NOTIZEN:
 Nur wenn relevant
 
-KURZ UND KNACKIG! Keine Wiederholungen.
+KURZ UND KNACKIG!
 """
 
 PHOTO_ANALYSIS_PROMPT = """
-Kategorisiere jedes Foto in einer Zeile:
+Kategorisiere jedes Foto:
 NUMMER|KATEGORIE|KURZBESCHREIBUNG
 
 Kategorien: FAMILIE, GARTEN, HAUS, SONSTIGES
-
-Beispiel:
-1|FAMILIE|Familienfoto 5 Personen
-2|GARTEN|Terrasse von oben
 """
 
 # --- Hilfsfunktionen ---
 
 def fix_image_orientation(image):
-    """Korrigiert die Bildorientierung basierend auf EXIF-Daten"""
+    """Korrigiert EXIF-Orientierung"""
     try:
-        # EXIF-Daten auslesen
         exif = image._getexif()
         if exif is None:
             return image
         
-        # Orientierung finden
         orientation_key = None
         for key, value in ExifTags.TAGS.items():
             if value == 'Orientation':
@@ -140,7 +132,6 @@ def fix_image_orientation(image):
         
         orientation = exif[orientation_key]
         
-        # Bild entsprechend drehen
         if orientation == 2:
             image = image.transpose(Image.FLIP_LEFT_RIGHT)
         elif orientation == 3:
@@ -157,42 +148,33 @@ def fix_image_orientation(image):
             image = image.rotate(90, expand=True)
         
         return image
-    except Exception:
+    except:
         return image
 
 
 def compress_image(image, max_size=800):
-    """Komprimiert Bilder und korrigiert Orientierung"""
-    # Erst Orientierung korrigieren
     image = fix_image_orientation(image)
-    
-    # Größe anpassen
     ratio = min(max_size / image.width, max_size / image.height)
     if ratio < 1:
         new_size = (int(image.width * ratio), int(image.height * ratio))
         image = image.resize(new_size, Image.LANCZOS)
-    
     if image.mode in ('RGBA', 'P'):
         image = image.convert('RGB')
-    
     return image
 
 
 def get_image_hash(image, hash_size=8):
-    """Perceptual Hash für Duplikat-Erkennung"""
     img = image.copy()
     img = fix_image_orientation(img)
     img = img.convert('L')
     img = img.resize((hash_size + 1, hash_size), Image.LANCZOS)
     pixels = list(img.getdata())
-    
     diff = []
     for row in range(hash_size):
         for col in range(hash_size):
             left = pixels[row * (hash_size + 1) + col]
             right = pixels[row * (hash_size + 1) + col + 1]
             diff.append(left > right)
-    
     return tuple(diff)
 
 
@@ -203,12 +185,10 @@ def hamming_distance(hash1, hash2):
 def find_duplicates(images, threshold=10):
     hashes = [get_image_hash(img) for img in images]
     duplicates = set()
-    
     for i in range(len(hashes)):
         for j in range(i + 1, len(hashes)):
             if hamming_distance(hashes[i], hashes[j]) < threshold:
                 duplicates.add(j)
-    
     return duplicates
 
 
@@ -411,7 +391,7 @@ def process_adaptive(images, image_names, additional_text="", delay=0):
         return result
     except Exception as e:
         if is_rate_limit_error(e):
-            st.warning("⚠️ Stufe 1 fehlgeschlagen. Wechsle zu Stufe 2...")
+            st.warning("⚠️ Wechsle zu Stufe 2...")
             wait_with_countdown(min(get_retry_delay(e), 30))
         else:
             raise e
@@ -424,7 +404,7 @@ def process_adaptive(images, image_names, additional_text="", delay=0):
             return result
         except Exception as e:
             if is_rate_limit_error(e):
-                st.warning("⚠️ Stufe 2 fehlgeschlagen. Wechsle zu Stufe 3...")
+                st.warning("⚠️ Wechsle zu Stufe 3...")
                 wait_with_countdown(min(get_retry_delay(e), 30))
             else:
                 raise e
@@ -435,9 +415,10 @@ def process_adaptive(images, image_names, additional_text="", delay=0):
     return result
 
 
-# --- Content Parser ---
+# --- Content Parser (VERBESSERT) ---
 
 def parse_content(content):
+    """Parst den KI-Output - VERBESSERTE VERSION"""
     data = {
         'family_name': 'FAMILIE',
         'city': 'ORT',
@@ -457,13 +438,16 @@ def parse_content(content):
         if not line:
             continue
         
+        # Erste Zeile: FAMILIENNAME|||ORT
         if '|||' in line and data['family_name'] == 'FAMILIE':
             parts = line.split('|||')
             data['family_name'] = parts[0].strip()
             data['city'] = parts[1].strip() if len(parts) > 1 else ''
             continue
         
-        line_upper = line.upper()
+        # Section Headers erkennen (case-insensitive)
+        line_upper = line.upper().replace(':', '')
+        
         if 'FAMILIENMITGLIEDER' in line_upper:
             current_section = 'members'
             continue
@@ -479,13 +463,14 @@ def parse_content(content):
         elif 'WÜNSCHE' in line_upper or 'WUENSCHE' in line_upper:
             current_section = 'wishes'
             continue
-        elif 'FAMILIE' in line_upper and current_section != 'members':
+        elif line_upper == 'DIE FAMILIE' or line_upper.startswith('DIE FAMILIE'):
             current_section = 'background'
             continue
         elif 'NOTIZEN' in line_upper or 'BESONDERHEITEN' in line_upper:
             current_section = 'notes'
             continue
         
+        # Content zu Sections hinzufügen
         if line.startswith('-') or line.startswith('•'):
             item = line[1:].strip()
             if current_section == 'members':
@@ -494,10 +479,16 @@ def parse_content(content):
                 data['garden_facts'].append(item)
             elif current_section == 'wishes':
                 data['wishes'].append(item)
-        elif current_section == 'background':
-            data['background'] += line + ' '
-        elif current_section == 'notes':
-            data['notes'] += line + ' '
+            elif current_section == 'background':
+                data['background'] += item + ' '
+            elif current_section == 'notes':
+                data['notes'] += item + ' '
+        else:
+            # Normaler Text (ohne Aufzählungszeichen)
+            if current_section == 'background':
+                data['background'] += line + ' '
+            elif current_section == 'notes':
+                data['notes'] += line + ' '
     
     data['background'] = data['background'].strip()
     data['notes'] = data['notes'].strip()
@@ -556,6 +547,28 @@ def wrap_text(c, text, max_width, font="Helvetica", size=9):
     return lines
 
 
+def format_member_name_bold(c, member, x, y):
+    """Schreibt den Namen fett und den Rest normal"""
+    # Versuche Name zu extrahieren (vor der Klammer oder vor dem Komma)
+    match = re.match(r'^([^(,]+)(.*)$', member)
+    if match:
+        name = match.group(1).strip()
+        rest = match.group(2).strip()
+        
+        # Name fett
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(x, y, f"• {name}")
+        name_width = c.stringWidth(f"• {name} ", "Helvetica-Bold", 9)
+        
+        # Rest normal
+        if rest:
+            c.setFont("Helvetica", 9)
+            c.drawString(x + name_width, y, rest)
+    else:
+        c.setFont("Helvetica", 9)
+        c.drawString(x, y, f"• {member}")
+
+
 def create_pdf_page1(c, data, family_photo=None, background_path=None):
     width, height = A4
     
@@ -567,7 +580,7 @@ def create_pdf_page1(c, data, family_photo=None, background_path=None):
         except:
             pass
     
-    # --- Titel (weiter unten, Y=720 statt 745) ---
+    # --- Titel ---
     title_y = height - 122
     title_text = f"EXPOSÉ FAMILIE {data['family_name']} AUS {data['city']}"
     
@@ -584,7 +597,6 @@ def create_pdf_page1(c, data, family_photo=None, background_path=None):
     margin_right = 20
     content_width = width - margin_left - margin_right
     
-    # Familienfoto: halbe Seitenbreite
     photo_width = (content_width / 2) - 10
     photo_height = 120
     photo_x = margin_left + 5
@@ -594,17 +606,18 @@ def create_pdf_page1(c, data, family_photo=None, background_path=None):
     
     current_y = height - 145
     
+    # Mehr Abstand unter Überschriften: text_start_offset
+    text_start_offset = 32  # Erhöht von 26/28
+    
     # --- Familienmitglieder + Foto ---
     if data['members']:
-        box_height = max(len(data['members']) * 14 + 35, photo_height + 15)
+        box_height = max(len(data['members']) * 14 + 38, photo_height + 15)
         
         draw_content_box(c, margin_left, current_y - box_height, content_width, box_height)
         
-        # Familienfoto (groß, halbe Breite)
         if family_photo:
             try:
                 img_buffer = io.BytesIO()
-                # Orientierung korrigieren
                 photo_corrected = fix_image_orientation(family_photo)
                 photo_corrected.save(img_buffer, format='JPEG', quality=90)
                 img_buffer.seek(0)
@@ -616,12 +629,11 @@ def create_pdf_page1(c, data, family_photo=None, background_path=None):
         
         draw_section_header(c, members_x - 5, current_y - 5, "Familienmitglieder:")
         
-        c.setFont("Helvetica", 9)
         c.setFillColorRGB(0.2, 0.2, 0.2)
-        text_y = current_y - 28
+        text_y = current_y - text_start_offset
         for member in data['members']:
             member_clean = member.replace('**', '').replace('*', '')
-            c.drawString(members_x + 5, text_y, f"• {member_clean}")
+            format_member_name_bold(c, member_clean, members_x + 5, text_y)
             text_y -= 14
         
         current_y -= box_height + 8
@@ -631,18 +643,18 @@ def create_pdf_page1(c, data, family_photo=None, background_path=None):
         facts_lines = []
         for fact in data['garden_facts']:
             wrapped = wrap_text(c, fact, content_width - 35)
-            for line in wrapped:
-                facts_lines.append(f"• {line}" if line == wrapped[0] else f"  {line}")
+            for i, line in enumerate(wrapped):
+                facts_lines.append(f"• {line}" if i == 0 else f"  {line}")
         if data['budget']:
             facts_lines.append(f"• Budget: {data['budget']} €")
         
-        box_height = len(facts_lines) * 12 + 28
+        box_height = len(facts_lines) * 12 + 32
         draw_content_box(c, margin_left, current_y - box_height, content_width, box_height)
         draw_section_header(c, margin_left + 5, current_y - 5, "Fakten zum Garten:")
         
         c.setFont("Helvetica", 9)
         c.setFillColorRGB(0.2, 0.2, 0.2)
-        text_y = current_y - 26
+        text_y = current_y - text_start_offset
         for line in facts_lines:
             c.drawString(margin_left + 15, text_y, line)
             text_y -= 12
@@ -655,32 +667,32 @@ def create_pdf_page1(c, data, family_photo=None, background_path=None):
         for wish in data['wishes']:
             wish_clean = wish.replace('**', '').replace('*', '')
             wrapped = wrap_text(c, wish_clean, content_width - 35)
-            for line in wrapped:
-                wish_lines.append(f"• {line}" if line == wrapped[0] else f"  {line}")
+            for i, line in enumerate(wrapped):
+                wish_lines.append(f"• {line}" if i == 0 else f"  {line}")
         
-        box_height = len(wish_lines) * 12 + 28
+        box_height = len(wish_lines) * 12 + 32
         draw_content_box(c, margin_left, current_y - box_height, content_width, box_height)
         draw_section_header(c, margin_left + 5, current_y - 5, "Wünsche für den Garten:")
         
         c.setFont("Helvetica", 9)
         c.setFillColorRGB(0.2, 0.2, 0.2)
-        text_y = current_y - 26
+        text_y = current_y - text_start_offset
         for line in wish_lines:
             c.drawString(margin_left + 15, text_y, line)
             text_y -= 12
         
         current_y -= box_height + 8
     
-    # --- Die Familie ---
+    # --- Die Familie (JETZT IMMER ANGEZEIGT) ---
     if data['background']:
         bg_lines = wrap_text(c, data['background'], content_width - 30)
-        box_height = len(bg_lines) * 12 + 28
+        box_height = len(bg_lines) * 12 + 32
         draw_content_box(c, margin_left, current_y - box_height, content_width, box_height)
         draw_section_header(c, margin_left + 5, current_y - 5, "Die Familie:")
         
         c.setFont("Helvetica", 9)
         c.setFillColorRGB(0.2, 0.2, 0.2)
-        text_y = current_y - 26
+        text_y = current_y - text_start_offset
         for line in bg_lines:
             c.drawString(margin_left + 15, text_y, line)
             text_y -= 12
@@ -690,13 +702,13 @@ def create_pdf_page1(c, data, family_photo=None, background_path=None):
     # --- Notizen ---
     if data['notes']:
         notes_lines = wrap_text(c, data['notes'], content_width - 30)
-        box_height = len(notes_lines) * 12 + 28
+        box_height = len(notes_lines) * 12 + 32
         draw_content_box(c, margin_left, current_y - box_height, content_width, box_height)
         draw_section_header(c, margin_left + 5, current_y - 5, "Notizen:")
         
         c.setFont("Helvetica", 9)
         c.setFillColorRGB(0.2, 0.2, 0.2)
-        text_y = current_y - 26
+        text_y = current_y - text_start_offset
         for line in notes_lines:
             c.drawString(margin_left + 15, text_y, line)
             text_y -= 12
@@ -781,9 +793,26 @@ def create_full_pdf(content, family_photo=None, garden_photos=None, photo_names=
     return buffer
 
 
-# --- UI ---
-st.title("🎬 Casting Exposé Generator")
-st.markdown("*Automatische Erstellung von Exposés aus Casting-Unterlagen*")
+# --- UI MIT LOGOS ---
+
+# Logos im Header anzeigen
+col_logo1, col_title, col_logo2 = st.columns([1, 3, 1])
+
+with col_logo1:
+    if os.path.exists("logo_ddg.png"):
+        st.image("logo_ddg.png", width=150)
+    else:
+        st.write("")  # Platzhalter
+
+with col_title:
+    st.title("🎬 Casting Exposé Generator")
+    st.markdown("*Automatische Erstellung von Exposés*")
+
+with col_logo2:
+    if os.path.exists("logo_redseven.png"):
+        st.image("logo_redseven.png", width=120)
+    else:
+        st.write("")  # Platzhalter
 
 st.divider()
 
@@ -975,4 +1004,4 @@ else:
     st.info("👆 Erst Unterlagen hochladen und Analyse starten.")
 
 st.divider()
-st.caption("🔒 Daten werden nur temporär verarbeitet. | gemini-2.5-flash-preview")
+st.caption("🔒 Daten werden nur temporär verarbeitet.")
