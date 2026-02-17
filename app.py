@@ -1,5 +1,5 @@
-# app.py - Casting Exposé Generator v1.4
-# Mit Einzelbild-Verarbeitung (1 Bild pro Minute)
+# app.py - Casting Exposé Generator v1.5
+# Mit gemini-2.5-flash-preview und flexibler Wartezeit (0-120s)
 
 import streamlit as st
 import google.generativeai as genai
@@ -112,7 +112,10 @@ def extract_text_from_docx(docx_file):
 
 
 def wait_with_countdown(seconds, message="Warte"):
-    """Zeigt einen Countdown"""
+    """Zeigt einen Countdown (nur wenn > 0)"""
+    if seconds <= 0:
+        return
+    
     progress_bar = st.progress(0)
     countdown_text = st.empty()
     
@@ -142,11 +145,11 @@ def call_gemini_safe(contents, max_retries=5):
             error_message = str(e)
             
             if "429" in error_message or "quota" in error_message.lower():
-                wait_time = 65
+                wait_time = 30
                 
                 match = re.search(r'retry_delay.*?(\d+)', error_message)
                 if match:
-                    wait_time = int(match.group(1)) + 10
+                    wait_time = int(match.group(1)) + 5
                 
                 if attempt < max_retries - 1:
                     st.warning(f"⏳ API-Limit. Warte {wait_time}s (Versuch {attempt + 1}/{max_retries})")
@@ -159,9 +162,9 @@ def call_gemini_safe(contents, max_retries=5):
     return None
 
 
-def process_images_one_by_one(images, image_names, delay=65):
+def process_images_one_by_one(images, image_names, delay=0):
     """
-    Verarbeitet Bilder einzeln mit 65 Sekunden Pause dazwischen.
+    Verarbeitet Bilder einzeln mit optionaler Pause dazwischen.
     """
     extracted_parts = []
     total = len(images)
@@ -172,7 +175,6 @@ def process_images_one_by_one(images, image_names, delay=65):
     for i, (img, name) in enumerate(zip(images, image_names)):
         status_text.markdown(f"### 🖼️ Verarbeite Bild {i+1}/{total}: `{name}`")
         
-        # Einzelnes Bild an Gemini senden
         result = call_gemini_safe([SINGLE_IMAGE_PROMPT, img])
         
         if result:
@@ -181,8 +183,8 @@ def process_images_one_by_one(images, image_names, delay=65):
         
         overall_progress.progress((i + 1) / total)
         
-        # Warte vor nächstem Bild (außer beim letzten)
-        if i < total - 1:
+        # Warte nur wenn delay > 0 und nicht letztes Bild
+        if delay > 0 and i < total - 1:
             status_text.markdown(f"### ⏳ Pause vor nächstem Bild...")
             wait_with_countdown(delay, f"Warte vor Bild {i+2}")
     
@@ -279,12 +281,6 @@ with col1:
         
         st.success(f"✅ {len(uploaded_files)} Datei(en)")
         st.caption(f"📷 {len(image_files)} Bilder | 📄 {len(pdf_files)} PDFs | 📝 {len(docx_files)} Word")
-        
-        if len(image_files) > 1:
-            estimated_time = (len(image_files) - 1) * 65 + len(image_files) * 10
-            mins = estimated_time // 60
-            secs = estimated_time % 60
-            st.info(f"⏱️ Geschätzte Dauer: **{mins} Min {secs} Sek** (1 Bild pro Minute)")
 
 with col2:
     st.subheader("📝 Text (optional)")
@@ -300,7 +296,9 @@ with st.expander("⚙️ Optionen"):
     with col1:
         max_image_size = st.slider("Bildgröße (px)", 512, 1024, 800, 128)
     with col2:
-        image_delay = st.slider("Pause zwischen Bildern (Sek.)", 60, 120, 70)
+        image_delay = st.slider("Pause zwischen Bildern (Sek.)", 0, 120, 0, 5)
+        if image_delay == 0:
+            st.caption("⚡ Schnellmodus: Keine Wartezeit")
 
 if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True):
     if not uploaded_files and not manual_text:
@@ -334,6 +332,7 @@ if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True
             # Verarbeitung
             if len(pil_images) == 0:
                 # Nur Text
+                st.info("📤 Verarbeite Text...")
                 result = call_gemini_safe([COMBINE_PROMPT.format(extracted_infos=extracted_text)])
             
             elif len(pil_images) == 1:
@@ -345,8 +344,8 @@ if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True
                 result = call_gemini_safe(contents)
             
             else:
-                # Mehrere Bilder: Einzelverarbeitung
-                st.warning(f"🐢 Starte langsame Verarbeitung: {len(pil_images)} Bilder, 1 pro Minute")
+                # Mehrere Bilder
+                st.info(f"📤 Verarbeite {len(pil_images)} Bilder...")
                 
                 extracted_parts = process_images_one_by_one(
                     pil_images, 
@@ -355,7 +354,6 @@ if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True
                 )
                 
                 st.info("🔗 Kombiniere Ergebnisse...")
-                wait_with_countdown(image_delay, "Pause vor Kombination")
                 result = combine_extracted_parts(extracted_parts, extracted_text)
             
             st.session_state["extracted_content"] = result
@@ -399,4 +397,4 @@ else:
     st.info("👆 Erst Unterlagen hochladen und Analyse starten.")
 
 st.divider()
-st.caption("🔒 Daten werden nur temporär verarbeitet.")
+st.caption("🔒 Daten werden nur temporär verarbeitet. | Modell: gemini-2.5-flash-preview")
