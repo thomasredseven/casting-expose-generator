@@ -1,5 +1,5 @@
-# app.py - Casting Exposé Generator v1.6
-# Mit adaptiver Verarbeitung: schnell → mittel → langsam
+# app.py - Casting Exposé Generator v1.7
+# Mit schönerem PDF-Design und gemini-2.5-flash-preview
 
 import streamlit as st
 import google.generativeai as genai
@@ -9,10 +9,12 @@ import time
 import re
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import cm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.units import cm, mm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.pdfgen import canvas
+from reportlab.platypus import BaseDocTemplate, Frame, PageTemplate
 import fitz
 from docx import Document
 
@@ -27,37 +29,54 @@ GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-3-flash-preview")
 
+# --- Farben (angelehnt an den Entwurf) ---
+COLORS = {
+    'primary_green': colors.HexColor('#4A7C23'),      # Dunkelgrün für Titel
+    'light_green': colors.HexColor('#E8F5E9'),        # Hellgrün für Hintergrund
+    'accent_green': colors.HexColor('#81C784'),       # Akzentgrün
+    'header_bg': colors.HexColor('#2E7D32'),          # Header-Hintergrund
+    'section_bg': colors.HexColor('#F1F8E9'),         # Section-Hintergrund
+    'text_dark': colors.HexColor('#1B5E20'),          # Dunkler Text
+    'text_body': colors.HexColor('#333333'),          # Body-Text
+    'white': colors.white,
+    'border': colors.HexColor('#A5D6A7'),             # Rahmenfarbe
+}
+
 # --- Prompts ---
 EXTRACTION_PROMPT = """
 Analysiere diese Casting-Unterlagen und extrahiere ALLE relevanten Informationen.
 
-Erstelle ein kompaktes Exposé mit dieser Struktur:
+Erstelle ein kompaktes Exposé mit EXAKT dieser Struktur (verwende genau diese Überschriften):
 
 ## FAMILIENNAME AUS ORT
 
 **Familienmitglieder:**
-(Name, Alter, Beruf - für jede Person)
+- Name (Alter), Beruf
+- Name (Alter), Beruf
+(für jede Person eine Zeile)
 
 **Fakten zum Garten:**
-- Größe
-- Besonderheiten (Zugang, Haustyp etc.)
+- Größe: X m²
+- Besonderheiten: ...
 
 **Budget:** X €
 
 **Wünsche für den Garten:**
-- (Aufzählung, kurz und prägnant)
+- Wunsch 1
+- Wunsch 2
+- Wunsch 3
 
 **Die Familie / Hintergrund:**
-(2-3 Sätze, interessante Details hervorheben)
+2-3 Sätze zur Familie und warum sie den Garten umgestalten wollen.
 
 **Besonderheiten / Notizen:**
-(TV-Erfahrung, Termine, Einschränkungen)
+TV-Erfahrung, Termine, Einschränkungen (falls vorhanden)
 
 WICHTIG:
 - Schreibe auf Deutsch
 - Kurz und prägnant
+- Keine Einleitung, direkt mit ## FAMILIENNAME beginnen
 - Ignoriere Datenschutzerklärungen
-- Wenn etwas unleserlich ist, schreibe [unleserlich]
 """
 
 SINGLE_IMAGE_PROMPT = """
@@ -72,28 +91,30 @@ Kombiniere diese extrahierten Informationen zu EINEM kompakten Exposé:
 
 ---
 
-Struktur:
+Verwende EXAKT diese Struktur:
 
 ## FAMILIENNAME AUS ORT
 
 **Familienmitglieder:**
-(Name, Alter, Beruf)
+- Name (Alter), Beruf
 
 **Fakten zum Garten:**
-- Größe, Besonderheiten
+- Größe: X m²
+- Besonderheiten: ...
 
 **Budget:** X €
 
 **Wünsche für den Garten:**
-- (Aufzählung)
+- Wunsch 1
+- Wunsch 2
 
 **Die Familie / Hintergrund:**
-(2-3 Sätze)
+2-3 Sätze
 
 **Besonderheiten / Notizen:**
-(TV-Erfahrung, Termine etc.)
+Falls vorhanden
 
-Kurz, prägnant, keine Duplikate, auf Deutsch.
+Keine Einleitung, direkt mit ## beginnen. Kurz, prägnant, auf Deutsch.
 """
 
 # --- Hilfsfunktionen ---
@@ -164,13 +185,13 @@ def get_retry_delay(error):
 
 
 def call_gemini(contents):
-    """Einfacher Gemini-Aufruf ohne Retry"""
+    """Einfacher Gemini-Aufruf"""
     response = model.generate_content(contents)
     return response.text
 
 
 def call_gemini_with_retry(contents, max_retries=3):
-    """Gemini-Aufruf mit Retry bei Rate-Limit"""
+    """Gemini-Aufruf mit Retry"""
     for attempt in range(max_retries):
         try:
             return call_gemini(contents)
@@ -184,24 +205,21 @@ def call_gemini_with_retry(contents, max_retries=3):
     return None
 
 
-# --- Adaptive Verarbeitungsstrategien ---
+# --- Adaptive Verarbeitung ---
 
 def strategy_all_at_once(images, additional_text=""):
-    """STUFE 1: Alle Bilder auf einmal senden"""
+    """STUFE 1: Alle Bilder auf einmal"""
     contents = [EXTRACTION_PROMPT]
-    
     if additional_text:
-        contents.append(f"\n\nZusätzliche Infos aus Dokumenten:\n{additional_text}\n\n")
-    
-    contents.append("Hier sind die Dokumente:")
+        contents.append(f"\n\nZusätzliche Infos:\n{additional_text}\n\n")
+    contents.append("Dokumente:")
     for img in images:
         contents.append(img)
-    
     return call_gemini(contents)
 
 
 def strategy_in_batches(images, image_names, additional_text="", batch_size=3, delay=0):
-    """STUFE 2: Bilder in Gruppen verarbeiten"""
+    """STUFE 2: In Gruppen"""
     extracted_parts = []
     total_batches = (len(images) + batch_size - 1) // batch_size
     
@@ -214,27 +232,24 @@ def strategy_in_batches(images, image_names, additional_text="", batch_size=3, d
         batch_images = images[start_idx:end_idx]
         batch_names = image_names[start_idx:end_idx]
         
-        status.markdown(f"### 📦 Verarbeite Gruppe {batch_num + 1}/{total_batches} ({len(batch_images)} Bilder)")
+        status.markdown(f"### 📦 Gruppe {batch_num + 1}/{total_batches}")
         
         contents = [SINGLE_IMAGE_PROMPT]
         for img in batch_images:
             contents.append(img)
         
         result = call_gemini_with_retry(contents)
-        
         if result:
-            extracted_parts.append(f"--- Gruppe {batch_num + 1}: {', '.join(batch_names)} ---\n{result}")
-            st.success(f"✅ Gruppe {batch_num + 1}/{total_batches} abgeschlossen")
+            extracted_parts.append(f"--- Gruppe {batch_num + 1} ---\n{result}")
         
         progress.progress((batch_num + 1) / total_batches)
         
         if delay > 0 and batch_num < total_batches - 1:
-            wait_with_countdown(delay, "Pause vor nächster Gruppe")
+            wait_with_countdown(delay)
     
     progress.empty()
     status.empty()
     
-    # Kombinieren
     all_infos = "\n\n".join(extracted_parts)
     if additional_text:
         all_infos = f"--- Textdokumente ---\n{additional_text}\n\n{all_infos}"
@@ -243,7 +258,7 @@ def strategy_in_batches(images, image_names, additional_text="", batch_size=3, d
 
 
 def strategy_one_by_one(images, image_names, additional_text="", delay=0):
-    """STUFE 3: Bilder einzeln verarbeiten"""
+    """STUFE 3: Einzeln"""
     extracted_parts = []
     total = len(images)
     
@@ -251,23 +266,20 @@ def strategy_one_by_one(images, image_names, additional_text="", delay=0):
     status = st.empty()
     
     for i, (img, name) in enumerate(zip(images, image_names)):
-        status.markdown(f"### 🖼️ Verarbeite Bild {i+1}/{total}: `{name}`")
+        status.markdown(f"### 🖼️ Bild {i+1}/{total}: `{name}`")
         
         result = call_gemini_with_retry([SINGLE_IMAGE_PROMPT, img])
-        
         if result:
-            extracted_parts.append(f"--- Bild {i+1}: {name} ---\n{result}")
-            st.success(f"✅ Bild {i+1}/{total} abgeschlossen")
+            extracted_parts.append(f"--- Bild {i+1} ---\n{result}")
         
         progress.progress((i + 1) / total)
         
         if delay > 0 and i < total - 1:
-            wait_with_countdown(delay, f"Pause vor Bild {i+2}")
+            wait_with_countdown(delay)
     
     progress.empty()
     status.empty()
     
-    # Kombinieren
     all_infos = "\n\n".join(extracted_parts)
     if additional_text:
         all_infos = f"--- Textdokumente ---\n{additional_text}\n\n{all_infos}"
@@ -276,108 +288,246 @@ def strategy_one_by_one(images, image_names, additional_text="", delay=0):
 
 
 def process_adaptive(images, image_names, additional_text="", delay=0):
-    """
-    Adaptive Verarbeitung: Startet schnell, wird bei Fehlern langsamer.
-    """
+    """Adaptive Verarbeitung"""
     num_images = len(images)
     
-    # Bei nur 1 Bild: direkt verarbeiten
     if num_images == 1:
-        st.info("📤 Verarbeite einzelnes Dokument...")
+        st.info("📤 Verarbeite Dokument...")
         contents = [EXTRACTION_PROMPT, images[0]]
         if additional_text:
             contents.append(f"\n\nZusätzliche Infos:\n{additional_text}")
         return call_gemini_with_retry(contents)
     
-    # STUFE 1: Alle auf einmal versuchen
-    st.info(f"🚀 **Stufe 1:** Versuche alle {num_images} Bilder auf einmal...")
-    
+    # STUFE 1
+    st.info(f"🚀 **Stufe 1:** Alle {num_images} Bilder auf einmal...")
     try:
         result = strategy_all_at_once(images, additional_text)
-        st.success("✅ Stufe 1 erfolgreich! Alle Bilder auf einmal verarbeitet.")
+        st.success("✅ Stufe 1 erfolgreich!")
         return result
-    
     except Exception as e:
         if is_rate_limit_error(e):
-            st.warning(f"⚠️ Stufe 1 fehlgeschlagen (API-Limit). Wechsle zu Stufe 2...")
-            
-            # Kurz warten bevor nächste Stufe
-            wait_time = get_retry_delay(e)
-            wait_with_countdown(min(wait_time, 30), "Kurze Pause vor Stufe 2")
+            st.warning("⚠️ Stufe 1 fehlgeschlagen. Wechsle zu Stufe 2...")
+            wait_with_countdown(min(get_retry_delay(e), 30))
         else:
             raise e
     
-    # STUFE 2: In 3er-Gruppen
+    # STUFE 2
     if num_images > 3:
-        st.info(f"📦 **Stufe 2:** Verarbeite in 3er-Gruppen...")
-        
+        st.info("📦 **Stufe 2:** 3er-Gruppen...")
         try:
             result = strategy_in_batches(images, image_names, additional_text, batch_size=3, delay=delay)
             st.success("✅ Stufe 2 erfolgreich!")
             return result
-        
         except Exception as e:
             if is_rate_limit_error(e):
-                st.warning(f"⚠️ Stufe 2 fehlgeschlagen. Wechsle zu Stufe 3...")
-                wait_time = get_retry_delay(e)
-                wait_with_countdown(min(wait_time, 30), "Kurze Pause vor Stufe 3")
+                st.warning("⚠️ Stufe 2 fehlgeschlagen. Wechsle zu Stufe 3...")
+                wait_with_countdown(min(get_retry_delay(e), 30))
             else:
                 raise e
     
-    # STUFE 3: Einzeln
-    st.info(f"🐢 **Stufe 3:** Verarbeite Bilder einzeln (langsam aber sicher)...")
-    
+    # STUFE 3
+    st.info("🐢 **Stufe 3:** Einzeln...")
     result = strategy_one_by_one(images, image_names, additional_text, delay=max(delay, 5))
     st.success("✅ Stufe 3 erfolgreich!")
     return result
 
 
-def create_pdf(content):
-    """Erstellt ein PDF"""
+# --- PDF-Erstellung (NEUES DESIGN) ---
+
+def draw_page_background(canvas, doc):
+    """Zeichnet den Seitenhintergrund"""
+    width, height = A4
+    
+    # Header-Bereich (grüner Balken oben)
+    canvas.setFillColor(COLORS['header_bg'])
+    canvas.rect(0, height - 2.5*cm, width, 2.5*cm, fill=True, stroke=False)
+    
+    # Subtiler grüner Rand unten
+    canvas.setFillColor(COLORS['accent_green'])
+    canvas.rect(0, 0, width, 0.5*cm, fill=True, stroke=False)
+    
+    # Linker Akzentstreifen
+    canvas.setFillColor(COLORS['light_green'])
+    canvas.rect(0, 0.5*cm, 0.5*cm, height - 3*cm, fill=True, stroke=False)
+
+
+def create_styled_pdf(content, show_name="Duell der Gartenprofis"):
+    """Erstellt ein schön gestaltetes PDF"""
     buffer = io.BytesIO()
     
-    doc = SimpleDocTemplate(
-        buffer, pagesize=A4,
-        rightMargin=2*cm, leftMargin=2*cm,
-        topMargin=2*cm, bottomMargin=2*cm
+    # Dokument mit custom PageTemplate
+    doc = BaseDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=1.5*cm,
+        leftMargin=1.5*cm,
+        topMargin=3.5*cm,
+        bottomMargin=1.5*cm
     )
     
+    # Frame für den Inhalt
+    frame = Frame(
+        doc.leftMargin,
+        doc.bottomMargin,
+        doc.width,
+        doc.height,
+        id='normal'
+    )
+    
+    # PageTemplate mit Hintergrund
+    template = PageTemplate(
+        id='styled',
+        frames=frame,
+        onPage=draw_page_background
+    )
+    doc.addPageTemplates([template])
+    
+    # Styles definieren
     styles = getSampleStyleSheet()
     
+    # Showname im Header
+    show_style = ParagraphStyle(
+        'ShowName',
+        parent=styles['Normal'],
+        fontSize=14,
+        textColor=COLORS['white'],
+        alignment=TA_CENTER,
+        fontName='Helvetica-Bold',
+        spaceAfter=0
+    )
+    
+    # Haupttitel (Familienname)
     title_style = ParagraphStyle(
-        'CustomTitle', parent=styles['Heading1'],
-        fontSize=18, spaceAfter=20, alignment=TA_CENTER,
-        textColor=colors.HexColor('#2E7D32')
+        'MainTitle',
+        parent=styles['Heading1'],
+        fontSize=22,
+        textColor=COLORS['primary_green'],
+        alignment=TA_CENTER,
+        fontName='Helvetica-Bold',
+        spaceBefore=10,
+        spaceAfter=15,
+        borderWidth=0,
+        borderColor=COLORS['border'],
+        borderPadding=5
     )
     
-    heading_style = ParagraphStyle(
-        'CustomHeading', parent=styles['Heading2'],
-        fontSize=12, spaceBefore=15, spaceAfter=8,
-        textColor=colors.HexColor('#1565C0')
+    # Section Headers
+    section_style = ParagraphStyle(
+        'SectionHeader',
+        parent=styles['Heading2'],
+        fontSize=13,
+        textColor=COLORS['text_dark'],
+        fontName='Helvetica-Bold',
+        spaceBefore=12,
+        spaceAfter=6,
+        borderWidth=0,
+        borderPadding=0,
+        underlineWidth=1,
+        underlineColor=COLORS['accent_green']
     )
     
+    # Body Text
     body_style = ParagraphStyle(
-        'CustomBody', parent=styles['Normal'],
-        fontSize=10, spaceAfter=6, leading=14
+        'BodyText',
+        parent=styles['Normal'],
+        fontSize=10,
+        textColor=COLORS['text_body'],
+        fontName='Helvetica',
+        spaceAfter=4,
+        leading=14
     )
     
+    # Aufzählungen
+    bullet_style = ParagraphStyle(
+        'BulletPoint',
+        parent=body_style,
+        leftIndent=15,
+        bulletIndent=5,
+        spaceAfter=3
+    )
+    
+    # Budget (hervorgehoben)
+    budget_style = ParagraphStyle(
+        'Budget',
+        parent=styles['Normal'],
+        fontSize=12,
+        textColor=COLORS['primary_green'],
+        fontName='Helvetica-Bold',
+        spaceBefore=8,
+        spaceAfter=8,
+        backColor=COLORS['light_green'],
+        borderWidth=1,
+        borderColor=COLORS['border'],
+        borderPadding=8,
+        borderRadius=3
+    )
+    
+    # Story aufbauen
     story = []
     
-    for line in content.split('\n'):
-        line = line.strip()
-        if not line:
-            story.append(Spacer(1, 6))
-        elif line.startswith('## '):
-            story.append(Paragraph(line[3:], title_style))
-        elif line.startswith('**') and line.endswith('**'):
-            story.append(Paragraph(line[2:-2], heading_style))
-        elif line.startswith('**') and ':**' in line:
-            story.append(Paragraph(line.replace('**', '<b>', 1).replace('**', '</b>', 1), body_style))
-        elif line.startswith('- '):
-            story.append(Paragraph('• ' + line[2:], body_style))
-        else:
-            story.append(Paragraph(line, body_style))
+    # Content parsen
+    lines = content.split('\n')
+    current_section = None
     
+    for line in lines:
+        line = line.strip()
+        
+        if not line:
+            story.append(Spacer(1, 4))
+            continue
+        
+        # Haupttitel (## FAMILIENNAME)
+        if line.startswith('## '):
+            title_text = line[3:].strip()
+            story.append(Paragraph(title_text, title_style))
+            story.append(Spacer(1, 10))
+            continue
+        
+        # Section Header (**Überschrift:**)
+        if line.startswith('**') and line.endswith(':**'):
+            section_text = line[2:-3].strip()
+            
+            # Dekorative Linie vor Section
+            story.append(Spacer(1, 8))
+            
+            # Section mit Unterstrich-Effekt
+            section_html = f'<u>{section_text}:</u>'
+            story.append(Paragraph(section_html, section_style))
+            current_section = section_text.lower()
+            continue
+        
+        # Section Header alternative (**Überschrift**)
+        if line.startswith('**') and line.endswith('**') and ':**' not in line:
+            section_text = line[2:-2].strip()
+            story.append(Spacer(1, 8))
+            story.append(Paragraph(f'<u>{section_text}</u>', section_style))
+            continue
+        
+        # Budget (spezielle Formatierung)
+        if line.lower().startswith('**budget'):
+            budget_text = line.replace('**', '').strip()
+            story.append(Paragraph(f'💰 {budget_text}', budget_style))
+            continue
+        
+        # Aufzählungspunkte
+        if line.startswith('- ') or line.startswith('• ') or line.startswith('* '):
+            bullet_text = line[2:].strip()
+            # Fett-Formatierung erhalten
+            bullet_text = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', bullet_text)
+            story.append(Paragraph(f'• {bullet_text}', bullet_style))
+            continue
+        
+        # Inline **fett** ersetzen
+        if '**' in line:
+            line = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', line)
+        
+        # Normaler Text
+        story.append(Paragraph(line, body_style))
+    
+    # Footer-Spacer
+    story.append(Spacer(1, 20))
+    
+    # PDF bauen
     doc.build(story)
     buffer.seek(0)
     return buffer
@@ -420,25 +570,19 @@ st.divider()
 st.header("2️⃣ Informationen extrahieren")
 
 with st.expander("⚙️ Optionen"):
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         max_image_size = st.slider("Bildgröße (px)", 512, 1024, 800, 128)
     with col2:
         fallback_delay = st.slider("Pause bei Fallback (Sek.)", 0, 60, 5, 5)
-    
-    st.info("""
-    **Adaptive Verarbeitung:**
-    - Stufe 1: Alle Bilder auf einmal (schnellste)
-    - Stufe 2: In 3er-Gruppen (bei API-Limit)
-    - Stufe 3: Einzeln (langsamste, aber sicherste)
-    """)
+    with col3:
+        show_name = st.text_input("Show-Name (für PDF)", value="Duell der Gartenprofis")
 
 if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True):
     if not uploaded_files and not manual_text:
         st.error("Bitte Dateien hochladen oder Text eingeben.")
     else:
         try:
-            # Text aus PDFs und Word extrahieren
             extracted_text = manual_text or ""
             
             for f in uploaded_files:
@@ -450,7 +594,6 @@ if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True
                     st.text(f"📝 Lese {f.name}...")
                     extracted_text += "\n\n" + extract_text_from_docx(f)
             
-            # Bilder vorbereiten
             pil_images = []
             image_names = []
             
@@ -462,21 +605,14 @@ if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True
                     pil_images.append(img)
                     image_names.append(f.name)
             
-            # Adaptive Verarbeitung
             if len(pil_images) == 0 and extracted_text:
-                # Nur Text
                 st.info("📤 Verarbeite Text...")
                 result = call_gemini_with_retry([EXTRACTION_PROMPT + "\n\n" + extracted_text])
             else:
-                # Bilder (adaptiv)
-                result = process_adaptive(
-                    pil_images, 
-                    image_names, 
-                    extracted_text,
-                    delay=fallback_delay
-                )
+                result = process_adaptive(pil_images, image_names, extracted_text, delay=fallback_delay)
             
             st.session_state["extracted_content"] = result
+            st.session_state["show_name"] = show_name
             st.success("✅ Analyse abgeschlossen!")
             st.balloons()
             
@@ -506,15 +642,26 @@ if "extracted_content" in st.session_state:
         st.write("")
         st.write("")
         if st.button("📥 PDF erstellen", type="primary"):
-            pdf_buffer = create_pdf(edited_content)
-            st.download_button(
-                "⬇️ PDF herunterladen",
-                data=pdf_buffer,
-                file_name=f"{family_name}.pdf",
-                mime="application/pdf"
-            )
+            try:
+                pdf_buffer = create_styled_pdf(
+                    edited_content, 
+                    show_name=st.session_state.get("show_name", "Duell der Gartenprofis")
+                )
+                st.download_button(
+                    "⬇️ PDF herunterladen",
+                    data=pdf_buffer,
+                    file_name=f"{family_name}.pdf",
+                    mime="application/pdf"
+                )
+            except Exception as e:
+                st.error(f"PDF-Fehler: {str(e)}")
+    
+    # Vorschau
+    with st.expander("👁️ Text-Vorschau"):
+        st.markdown(edited_content)
+
 else:
     st.info("👆 Erst Unterlagen hochladen und Analyse starten.")
 
 st.divider()
-st.caption("🔒 Daten werden nur temporär verarbeitet. | Modell: gemini-2.5-flash-preview | Adaptive Verarbeitung")
+st.caption("🔒 Daten werden nur temporär verarbeitet. | Modell: gemini-2.5-flash-preview")
