@@ -25,7 +25,7 @@ st.set_page_config(
 
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash-latest")
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 # --- Prompts ---
 SINGLE_IMAGE_PROMPT = """
