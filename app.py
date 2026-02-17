@@ -1,5 +1,5 @@
-# app.py - Casting Exposé Generator v1.5
-# Mit gemini-2.5-flash-preview und flexibler Wartezeit (0-120s)
+# app.py - Casting Exposé Generator v1.6
+# Mit adaptiver Verarbeitung: schnell → mittel → langsam
 
 import streamlit as st
 import google.generativeai as genai
@@ -25,33 +25,13 @@ st.set_page_config(
 
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-3-flash-preview")
+model = genai.GenerativeModel("gemini-2.5-flash-preview-04-17")
 
 # --- Prompts ---
-SINGLE_IMAGE_PROMPT = """
-Analysiere dieses Dokument und extrahiere ALLE relevanten Informationen.
+EXTRACTION_PROMPT = """
+Analysiere diese Casting-Unterlagen und extrahiere ALLE relevanten Informationen.
 
-Extrahiere (falls vorhanden):
-- Namen, Alter, Berufe der Familienmitglieder
-- Adresse, Ort
-- Informationen zum Garten (Größe, Zustand, Besonderheiten)
-- Budget
-- Wünsche und Pläne
-- Persönliche Hintergründe
-- TV-Erfahrung, Termine, Einschränkungen
-
-Ignoriere Datenschutzerklärungen und rechtliche Texte.
-Schreibe auf Deutsch. Wenn etwas unleserlich ist, schreibe [unleserlich].
-"""
-
-COMBINE_PROMPT = """
-Kombiniere die folgenden extrahierten Informationen zu EINEM kompakten Exposé:
-
-{extracted_infos}
-
----
-
-Erstelle daraus ein Exposé mit dieser Struktur:
+Erstelle ein kompaktes Exposé mit dieser Struktur:
 
 ## FAMILIENNAME AUS ORT
 
@@ -60,7 +40,7 @@ Erstelle daraus ein Exposé mit dieser Struktur:
 
 **Fakten zum Garten:**
 - Größe
-- Besonderheiten
+- Besonderheiten (Zugang, Haustyp etc.)
 
 **Budget:** X €
 
@@ -68,18 +48,58 @@ Erstelle daraus ein Exposé mit dieser Struktur:
 - (Aufzählung, kurz und prägnant)
 
 **Die Familie / Hintergrund:**
-(2-3 Sätze, interessante Details)
+(2-3 Sätze, interessante Details hervorheben)
+
+**Besonderheiten / Notizen:**
+(TV-Erfahrung, Termine, Einschränkungen)
+
+WICHTIG:
+- Schreibe auf Deutsch
+- Kurz und prägnant
+- Ignoriere Datenschutzerklärungen
+- Wenn etwas unleserlich ist, schreibe [unleserlich]
+"""
+
+SINGLE_IMAGE_PROMPT = """
+Extrahiere ALLE Informationen aus diesem Dokument.
+Schreibe auf Deutsch. Bei unleserlichem Text: [unleserlich].
+"""
+
+COMBINE_PROMPT = """
+Kombiniere diese extrahierten Informationen zu EINEM kompakten Exposé:
+
+{extracted_infos}
+
+---
+
+Struktur:
+
+## FAMILIENNAME AUS ORT
+
+**Familienmitglieder:**
+(Name, Alter, Beruf)
+
+**Fakten zum Garten:**
+- Größe, Besonderheiten
+
+**Budget:** X €
+
+**Wünsche für den Garten:**
+- (Aufzählung)
+
+**Die Familie / Hintergrund:**
+(2-3 Sätze)
 
 **Besonderheiten / Notizen:**
 (TV-Erfahrung, Termine etc.)
 
-WICHTIG: Kurz, prägnant, keine Duplikate, auf Deutsch.
+Kurz, prägnant, keine Duplikate, auf Deutsch.
 """
 
 # --- Hilfsfunktionen ---
 
 def compress_image(image, max_size=800):
-    """Komprimiert Bilder stark um Token zu sparen."""
+    """Komprimiert Bilder"""
     ratio = min(max_size / image.width, max_size / image.height)
     if ratio < 1:
         new_size = (int(image.width * ratio), int(image.height * ratio))
@@ -112,7 +132,7 @@ def extract_text_from_docx(docx_file):
 
 
 def wait_with_countdown(seconds, message="Warte"):
-    """Zeigt einen Countdown (nur wenn > 0)"""
+    """Zeigt einen Countdown"""
     if seconds <= 0:
         return
     
@@ -121,12 +141,7 @@ def wait_with_countdown(seconds, message="Warte"):
     
     for i in range(seconds):
         remaining = seconds - i
-        mins = remaining // 60
-        secs = remaining % 60
-        if mins > 0:
-            countdown_text.text(f"⏱️ {message}... {mins}:{secs:02d}")
-        else:
-            countdown_text.text(f"⏱️ {message}... {secs} Sekunden")
+        countdown_text.text(f"⏱️ {message}... {remaining}s")
         progress_bar.progress((i + 1) / seconds)
         time.sleep(1)
     
@@ -134,74 +149,187 @@ def wait_with_countdown(seconds, message="Warte"):
     progress_bar.empty()
 
 
-def call_gemini_safe(contents, max_retries=5):
-    """Ruft Gemini API auf mit Retry"""
+def is_rate_limit_error(error):
+    """Prüft ob es ein Rate-Limit-Fehler ist"""
+    error_str = str(error).lower()
+    return "429" in error_str or "quota" in error_str or "rate" in error_str or "limit" in error_str
+
+
+def get_retry_delay(error):
+    """Extrahiert Wartezeit aus Fehlermeldung"""
+    match = re.search(r'retry_delay.*?(\d+)', str(error))
+    if match:
+        return int(match.group(1)) + 5
+    return 30
+
+
+def call_gemini(contents):
+    """Einfacher Gemini-Aufruf ohne Retry"""
+    response = model.generate_content(contents)
+    return response.text
+
+
+def call_gemini_with_retry(contents, max_retries=3):
+    """Gemini-Aufruf mit Retry bei Rate-Limit"""
     for attempt in range(max_retries):
         try:
-            response = model.generate_content(contents)
-            return response.text
-        
+            return call_gemini(contents)
         except Exception as e:
-            error_message = str(e)
-            
-            if "429" in error_message or "quota" in error_message.lower():
-                wait_time = 30
-                
-                match = re.search(r'retry_delay.*?(\d+)', error_message)
-                if match:
-                    wait_time = int(match.group(1)) + 5
-                
-                if attempt < max_retries - 1:
-                    st.warning(f"⏳ API-Limit. Warte {wait_time}s (Versuch {attempt + 1}/{max_retries})")
-                    wait_with_countdown(wait_time, "Warte auf API")
-                else:
-                    raise Exception("API-Limit nach allen Versuchen erreicht.")
+            if is_rate_limit_error(e) and attempt < max_retries - 1:
+                wait_time = get_retry_delay(e)
+                st.warning(f"⏳ Rate-Limit. Warte {wait_time}s... (Versuch {attempt + 1}/{max_retries})")
+                wait_with_countdown(wait_time)
             else:
                 raise e
-    
     return None
 
 
-def process_images_one_by_one(images, image_names, delay=0):
-    """
-    Verarbeitet Bilder einzeln mit optionaler Pause dazwischen.
-    """
+# --- Adaptive Verarbeitungsstrategien ---
+
+def strategy_all_at_once(images, additional_text=""):
+    """STUFE 1: Alle Bilder auf einmal senden"""
+    contents = [EXTRACTION_PROMPT]
+    
+    if additional_text:
+        contents.append(f"\n\nZusätzliche Infos aus Dokumenten:\n{additional_text}\n\n")
+    
+    contents.append("Hier sind die Dokumente:")
+    for img in images:
+        contents.append(img)
+    
+    return call_gemini(contents)
+
+
+def strategy_in_batches(images, image_names, additional_text="", batch_size=3, delay=0):
+    """STUFE 2: Bilder in Gruppen verarbeiten"""
+    extracted_parts = []
+    total_batches = (len(images) + batch_size - 1) // batch_size
+    
+    progress = st.progress(0)
+    status = st.empty()
+    
+    for batch_num in range(total_batches):
+        start_idx = batch_num * batch_size
+        end_idx = min(start_idx + batch_size, len(images))
+        batch_images = images[start_idx:end_idx]
+        batch_names = image_names[start_idx:end_idx]
+        
+        status.markdown(f"### 📦 Verarbeite Gruppe {batch_num + 1}/{total_batches} ({len(batch_images)} Bilder)")
+        
+        contents = [SINGLE_IMAGE_PROMPT]
+        for img in batch_images:
+            contents.append(img)
+        
+        result = call_gemini_with_retry(contents)
+        
+        if result:
+            extracted_parts.append(f"--- Gruppe {batch_num + 1}: {', '.join(batch_names)} ---\n{result}")
+            st.success(f"✅ Gruppe {batch_num + 1}/{total_batches} abgeschlossen")
+        
+        progress.progress((batch_num + 1) / total_batches)
+        
+        if delay > 0 and batch_num < total_batches - 1:
+            wait_with_countdown(delay, "Pause vor nächster Gruppe")
+    
+    progress.empty()
+    status.empty()
+    
+    # Kombinieren
+    all_infos = "\n\n".join(extracted_parts)
+    if additional_text:
+        all_infos = f"--- Textdokumente ---\n{additional_text}\n\n{all_infos}"
+    
+    return call_gemini_with_retry([COMBINE_PROMPT.format(extracted_infos=all_infos)])
+
+
+def strategy_one_by_one(images, image_names, additional_text="", delay=0):
+    """STUFE 3: Bilder einzeln verarbeiten"""
     extracted_parts = []
     total = len(images)
     
-    overall_progress = st.progress(0)
-    status_text = st.empty()
+    progress = st.progress(0)
+    status = st.empty()
     
     for i, (img, name) in enumerate(zip(images, image_names)):
-        status_text.markdown(f"### 🖼️ Verarbeite Bild {i+1}/{total}: `{name}`")
+        status.markdown(f"### 🖼️ Verarbeite Bild {i+1}/{total}: `{name}`")
         
-        result = call_gemini_safe([SINGLE_IMAGE_PROMPT, img])
+        result = call_gemini_with_retry([SINGLE_IMAGE_PROMPT, img])
         
         if result:
             extracted_parts.append(f"--- Bild {i+1}: {name} ---\n{result}")
             st.success(f"✅ Bild {i+1}/{total} abgeschlossen")
         
-        overall_progress.progress((i + 1) / total)
+        progress.progress((i + 1) / total)
         
-        # Warte nur wenn delay > 0 und nicht letztes Bild
         if delay > 0 and i < total - 1:
-            status_text.markdown(f"### ⏳ Pause vor nächstem Bild...")
-            wait_with_countdown(delay, f"Warte vor Bild {i+2}")
+            wait_with_countdown(delay, f"Pause vor Bild {i+2}")
     
-    status_text.empty()
-    overall_progress.empty()
+    progress.empty()
+    status.empty()
     
-    return extracted_parts
-
-
-def combine_extracted_parts(parts, additional_text=""):
-    """Kombiniert die extrahierten Teile zu einem Exposé"""
-    all_infos = "\n\n".join(parts)
+    # Kombinieren
+    all_infos = "\n\n".join(extracted_parts)
     if additional_text:
         all_infos = f"--- Textdokumente ---\n{additional_text}\n\n{all_infos}"
     
-    prompt = COMBINE_PROMPT.format(extracted_infos=all_infos)
-    return call_gemini_safe([prompt])
+    return call_gemini_with_retry([COMBINE_PROMPT.format(extracted_infos=all_infos)])
+
+
+def process_adaptive(images, image_names, additional_text="", delay=0):
+    """
+    Adaptive Verarbeitung: Startet schnell, wird bei Fehlern langsamer.
+    """
+    num_images = len(images)
+    
+    # Bei nur 1 Bild: direkt verarbeiten
+    if num_images == 1:
+        st.info("📤 Verarbeite einzelnes Dokument...")
+        contents = [EXTRACTION_PROMPT, images[0]]
+        if additional_text:
+            contents.append(f"\n\nZusätzliche Infos:\n{additional_text}")
+        return call_gemini_with_retry(contents)
+    
+    # STUFE 1: Alle auf einmal versuchen
+    st.info(f"🚀 **Stufe 1:** Versuche alle {num_images} Bilder auf einmal...")
+    
+    try:
+        result = strategy_all_at_once(images, additional_text)
+        st.success("✅ Stufe 1 erfolgreich! Alle Bilder auf einmal verarbeitet.")
+        return result
+    
+    except Exception as e:
+        if is_rate_limit_error(e):
+            st.warning(f"⚠️ Stufe 1 fehlgeschlagen (API-Limit). Wechsle zu Stufe 2...")
+            
+            # Kurz warten bevor nächste Stufe
+            wait_time = get_retry_delay(e)
+            wait_with_countdown(min(wait_time, 30), "Kurze Pause vor Stufe 2")
+        else:
+            raise e
+    
+    # STUFE 2: In 3er-Gruppen
+    if num_images > 3:
+        st.info(f"📦 **Stufe 2:** Verarbeite in 3er-Gruppen...")
+        
+        try:
+            result = strategy_in_batches(images, image_names, additional_text, batch_size=3, delay=delay)
+            st.success("✅ Stufe 2 erfolgreich!")
+            return result
+        
+        except Exception as e:
+            if is_rate_limit_error(e):
+                st.warning(f"⚠️ Stufe 2 fehlgeschlagen. Wechsle zu Stufe 3...")
+                wait_time = get_retry_delay(e)
+                wait_with_countdown(min(wait_time, 30), "Kurze Pause vor Stufe 3")
+            else:
+                raise e
+    
+    # STUFE 3: Einzeln
+    st.info(f"🐢 **Stufe 3:** Verarbeite Bilder einzeln (langsam aber sicher)...")
+    
+    result = strategy_one_by_one(images, image_names, additional_text, delay=max(delay, 5))
+    st.success("✅ Stufe 3 erfolgreich!")
+    return result
 
 
 def create_pdf(content):
@@ -296,9 +424,14 @@ with st.expander("⚙️ Optionen"):
     with col1:
         max_image_size = st.slider("Bildgröße (px)", 512, 1024, 800, 128)
     with col2:
-        image_delay = st.slider("Pause zwischen Bildern (Sek.)", 0, 120, 0, 5)
-        if image_delay == 0:
-            st.caption("⚡ Schnellmodus: Keine Wartezeit")
+        fallback_delay = st.slider("Pause bei Fallback (Sek.)", 0, 60, 5, 5)
+    
+    st.info("""
+    **Adaptive Verarbeitung:**
+    - Stufe 1: Alle Bilder auf einmal (schnellste)
+    - Stufe 2: In 3er-Gruppen (bei API-Limit)
+    - Stufe 3: Einzeln (langsamste, aber sicherste)
+    """)
 
 if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True):
     if not uploaded_files and not manual_text:
@@ -329,32 +462,19 @@ if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True
                     pil_images.append(img)
                     image_names.append(f.name)
             
-            # Verarbeitung
-            if len(pil_images) == 0:
+            # Adaptive Verarbeitung
+            if len(pil_images) == 0 and extracted_text:
                 # Nur Text
                 st.info("📤 Verarbeite Text...")
-                result = call_gemini_safe([COMBINE_PROMPT.format(extracted_infos=extracted_text)])
-            
-            elif len(pil_images) == 1:
-                # Einzelnes Bild
-                st.info("📤 Sende Dokument an Gemini...")
-                contents = [SINGLE_IMAGE_PROMPT, pil_images[0]]
-                if extracted_text:
-                    contents.append(f"\n\nZusätzliche Infos:\n{extracted_text}")
-                result = call_gemini_safe(contents)
-            
+                result = call_gemini_with_retry([EXTRACTION_PROMPT + "\n\n" + extracted_text])
             else:
-                # Mehrere Bilder
-                st.info(f"📤 Verarbeite {len(pil_images)} Bilder...")
-                
-                extracted_parts = process_images_one_by_one(
+                # Bilder (adaptiv)
+                result = process_adaptive(
                     pil_images, 
-                    image_names,
-                    delay=image_delay
+                    image_names, 
+                    extracted_text,
+                    delay=fallback_delay
                 )
-                
-                st.info("🔗 Kombiniere Ergebnisse...")
-                result = combine_extracted_parts(extracted_parts, extracted_text)
             
             st.session_state["extracted_content"] = result
             st.success("✅ Analyse abgeschlossen!")
@@ -397,4 +517,4 @@ else:
     st.info("👆 Erst Unterlagen hochladen und Analyse starten.")
 
 st.divider()
-st.caption("🔒 Daten werden nur temporär verarbeitet. | Modell: gemini-2.5-flash-preview")
+st.caption("🔒 Daten werden nur temporär verarbeitet. | Modell: gemini-2.5-flash-preview | Adaptive Verarbeitung")
