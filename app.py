@@ -1,11 +1,12 @@
-# app.py - Casting Exposé Generator v1.2
-# Mit Bildkomprimierung, Retry-Logik und Warte-Dialog
+# app.py - Casting Exposé Generator v1.3
+# Mit Chunk-Verarbeitung, Bildkomprimierung und Retry-Logik
 
 import streamlit as st
 import google.generativeai as genai
 from PIL import Image
 import io
 import time
+import re
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
@@ -27,7 +28,7 @@ GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.0-flash")
 
-# --- Prompt für Extraktion ---
+# --- Prompts ---
 EXTRACTION_PROMPT = """
 Analysiere die folgenden Casting-Unterlagen und extrahiere die wichtigsten Informationen.
 
@@ -61,20 +62,73 @@ WICHTIG:
 - Das Exposé soll auf eine Seite passen
 """
 
+CHUNK_EXTRACTION_PROMPT = """
+Analysiere diese Dokument-Seite(n) und extrahiere ALLE relevanten Informationen für ein Casting-Exposé.
+
+Extrahiere (falls vorhanden):
+- Namen, Alter, Berufe der Familienmitglieder
+- Adresse, Ort
+- Informationen zum Garten (Größe, Zustand, Besonderheiten)
+- Budget
+- Wünsche und Pläne für den Garten
+- Persönliche Hintergründe, Backstory
+- TV-Erfahrung, Termine, Einschränkungen
+
+Ignoriere:
+- Datenschutzerklärungen
+- Rechtliche Texte
+- Unterschriften-Felder
+
+Gib die Informationen strukturiert zurück. Wenn du etwas nicht lesen kannst, schreibe [unleserlich].
+"""
+
+COMBINE_PROMPT = """
+Hier sind extrahierte Informationen aus verschiedenen Dokumenten einer Casting-Bewerbung.
+Kombiniere diese zu EINEM kompakten Exposé.
+
+{extracted_infos}
+
+---
+
+Erstelle daraus ein Exposé mit folgender Struktur:
+
+## FAMILIENNAME AUS ORT
+
+**Familienmitglieder:**
+(Name, Alter, Beruf - für jede Person)
+
+**Fakten zum Garten:**
+- Größe
+- Besonderheiten (Zugang, Haustyp etc.)
+
+**Budget:** X €
+
+**Wünsche für den Garten:**
+- (Aufzählung der wichtigsten Wünsche, kurz und prägnant)
+
+**Die Familie / Hintergrund:**
+(2-3 Sätze zur Familie und warum sie den Garten umgestalten wollen. Interessante Details hervorheben.)
+
+**Besonderheiten / Notizen:**
+(Falls relevant: TV-Erfahrung, Termine, Einschränkungen)
+
+WICHTIG:
+- Schreibe auf Deutsch
+- Fasse dich kurz und prägnant
+- Nur relevante, interessante Informationen
+- Keine Duplikate
+- Das Exposé soll auf eine Seite passen
+"""
+
 # --- Hilfsfunktionen ---
 
-def compress_image(image, max_size=1024, quality=85):
-    """
-    Komprimiert Bilder um Token zu sparen.
-    Reduziert Auflösung auf max 1024px und optimiert Qualität.
-    """
-    # Größe reduzieren wenn nötig
+def compress_image(image, max_size=1024):
+    """Komprimiert Bilder um Token zu sparen."""
     ratio = min(max_size / image.width, max_size / image.height)
     if ratio < 1:
         new_size = (int(image.width * ratio), int(image.height * ratio))
         image = image.resize(new_size, Image.LANCZOS)
     
-    # In RGB konvertieren falls nötig (für JPEG-Kompatibilität)
     if image.mode in ('RGBA', 'P'):
         image = image.convert('RGB')
     
@@ -101,10 +155,24 @@ def extract_text_from_docx(docx_file):
     return text
 
 
-def call_gemini_with_retry(contents, max_retries=3, initial_wait=45):
+def wait_with_countdown(seconds, message="Warte"):
+    """Zeigt einen Countdown mit Progress-Bar"""
+    progress_bar = st.progress(0)
+    countdown_text = st.empty()
+    
+    for i in range(seconds):
+        remaining = seconds - i
+        countdown_text.text(f"⏱️ {message}... Noch {remaining} Sekunden")
+        progress_bar.progress((i + 1) / seconds)
+        time.sleep(1)
+    
+    countdown_text.empty()
+    progress_bar.empty()
+
+
+def call_gemini_safe(contents, max_retries=3):
     """
     Ruft Gemini API auf mit automatischem Retry bei Rate-Limit-Fehlern.
-    Zeigt einen Countdown während der Wartezeit.
     """
     for attempt in range(max_retries):
         try:
@@ -114,82 +182,71 @@ def call_gemini_with_retry(contents, max_retries=3, initial_wait=45):
         except Exception as e:
             error_message = str(e)
             
-            # Prüfen ob es ein Rate-Limit-Fehler ist
             if "429" in error_message or "quota" in error_message.lower() or "rate" in error_message.lower():
+                wait_time = 60
                 
-                # Wartezeit aus Fehlermeldung extrahieren oder Standard verwenden
-                wait_time = initial_wait
-                if "retry_delay" in error_message:
-                    try:
-                        # Versuche Wartezeit aus Fehler zu parsen
-                        import re
-                        match = re.search(r'retry_delay.*?(\d+)', error_message)
-                        if match:
-                            wait_time = int(match.group(1)) + 5  # +5 Sekunden Puffer
-                    except:
-                        pass
+                # Versuche Wartezeit aus Fehler zu parsen
+                match = re.search(r'retry_delay.*?(\d+)', error_message)
+                if match:
+                    wait_time = int(match.group(1)) + 10
                 
                 if attempt < max_retries - 1:
-                    # Warte-Dialog mit Countdown anzeigen
-                    st.warning(f"⏳ API-Limit erreicht. Warte {wait_time} Sekunden vor erneutem Versuch... (Versuch {attempt + 1}/{max_retries})")
-                    
-                    # Countdown anzeigen
-                    progress_bar = st.progress(0)
-                    countdown_text = st.empty()
-                    
-                    for i in range(wait_time):
-                        remaining = wait_time - i
-                        countdown_text.text(f"⏱️ Noch {remaining} Sekunden...")
-                        progress_bar.progress((i + 1) / wait_time)
-                        time.sleep(1)
-                    
-                    countdown_text.empty()
-                    progress_bar.empty()
+                    st.warning(f"⏳ API-Limit erreicht. (Versuch {attempt + 1}/{max_retries})")
+                    wait_with_countdown(wait_time, "Warte auf API")
                     st.info("🔄 Versuche erneut...")
                 else:
-                    # Alle Versuche aufgebraucht
                     raise Exception(
                         f"API-Limit auch nach {max_retries} Versuchen noch erreicht. "
-                        f"Bitte warte einige Minuten und versuche es dann erneut, "
-                        f"oder verwende weniger/kleinere Bilder."
+                        f"Bitte versuche es in einigen Minuten erneut."
                     )
             else:
-                # Anderer Fehler - direkt weitergeben
                 raise e
     
     return None
 
 
-def extract_info_combined(images, text):
-    """Kombiniert Bilder und Text für Extraktion"""
-    contents = [EXTRACTION_PROMPT + "\n\nHier sind die Unterlagen:\n"]
+def process_images_in_chunks(images, chunk_size=3, delay_between_chunks=65):
+    """
+    Verarbeitet Bilder in kleinen Chunks mit Wartezeit dazwischen.
+    Sammelt Teilergebnisse und kombiniert sie am Ende.
+    """
+    extracted_parts = []
+    total_chunks = (len(images) + chunk_size - 1) // chunk_size
     
-    if text:
-        contents.append(f"TEXTUELLE INFORMATIONEN:\n{text}\n\n")
-    
-    if images:
-        contents.append("GESCANNTE DOKUMENTE/BILDER:")
-        for img in images:
+    for i in range(0, len(images), chunk_size):
+        chunk = images[i:i + chunk_size]
+        chunk_num = (i // chunk_size) + 1
+        
+        st.info(f"📦 Verarbeite Chunk {chunk_num}/{total_chunks} ({len(chunk)} Bilder)...")
+        
+        # Chunk an Gemini senden
+        contents = [CHUNK_EXTRACTION_PROMPT]
+        for img in chunk:
             contents.append(img)
+        
+        result = call_gemini_safe(contents)
+        if result:
+            extracted_parts.append(f"--- Teil {chunk_num} ---\n{result}")
+            st.success(f"✅ Chunk {chunk_num}/{total_chunks} abgeschlossen")
+        
+        # Warten vor nächstem Chunk (außer beim letzten)
+        if i + chunk_size < len(images):
+            st.info(f"⏳ Warte {delay_between_chunks} Sekunden vor nächstem Chunk (API-Limit)...")
+            wait_with_countdown(delay_between_chunks, "Pause zwischen Chunks")
     
-    # Mit Retry-Logik aufrufen
-    return call_gemini_with_retry(contents)
+    return extracted_parts
 
 
-def extract_info_from_images(images):
-    """Extrahiert Informationen aus Bildern via Gemini"""
-    contents = [EXTRACTION_PROMPT]
-    for img in images:
-        contents.append(img)
+def combine_extracted_parts(parts, additional_text=""):
+    """Kombiniert die extrahierten Teile zu einem finalen Exposé"""
     
-    return call_gemini_with_retry(contents)
-
-
-def extract_info_from_text(text):
-    """Extrahiert Informationen aus Text via Gemini"""
-    prompt = EXTRACTION_PROMPT + "\n\nHier sind die Unterlagen:\n\n" + text
+    all_infos = "\n\n".join(parts)
+    if additional_text:
+        all_infos = f"--- Textuelle Dokumente ---\n{additional_text}\n\n{all_infos}"
     
-    return call_gemini_with_retry([prompt])
+    prompt = COMBINE_PROMPT.format(extracted_infos=all_infos)
+    
+    return call_gemini_safe([prompt])
 
 
 def create_pdf(content, title="Exposé"):
@@ -277,7 +334,6 @@ with col1:
     )
     
     if uploaded_files:
-        # Dateien kategorisieren
         image_files = [f for f in uploaded_files if f.type.startswith('image/')]
         pdf_files = [f for f in uploaded_files if f.type == 'application/pdf']
         docx_files = [f for f in uploaded_files if f.type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document']
@@ -285,20 +341,19 @@ with col1:
         st.success(f"✅ {len(uploaded_files)} Datei(en) hochgeladen")
         st.caption(f"📷 {len(image_files)} Bilder | 📄 {len(pdf_files)} PDFs | 📝 {len(docx_files)} Word-Dokumente")
         
-        # Warnung bei vielen Bildern
-        if len(image_files) > 5:
-            st.warning(
-                f"⚠️ {len(image_files)} Bilder hochgeladen. "
-                f"Bilder werden automatisch komprimiert um API-Limits zu vermeiden. "
-                f"Bei Problemen: Versuche es mit weniger Bildern (3-5 reichen meist)."
+        if len(image_files) > 3:
+            estimated_time = ((len(image_files) // 3) * 65) + 30
+            st.info(
+                f"ℹ️ Bei {len(image_files)} Bildern wird die Chunk-Verarbeitung aktiviert. "
+                f"Geschätzte Dauer: ~{estimated_time // 60} Minuten {estimated_time % 60} Sekunden"
             )
         
         with st.expander("Vorschau Bilder"):
             if image_files:
-                cols = st.columns(min(len(image_files), 3))
+                cols = st.columns(min(len(image_files), 4))
                 for i, img_file in enumerate(image_files):
-                    with cols[i % 3]:
-                        st.image(img_file, use_container_width=True)
+                    with cols[i % 4]:
+                        st.image(img_file, use_container_width=True, caption=img_file.name)
             else:
                 st.info("Keine Bilder hochgeladen")
 
@@ -307,7 +362,7 @@ with col2:
     manual_text = st.text_area(
         "E-Mail-Text, Notizen etc.",
         height=200,
-        placeholder="Hier können Sie zusätzlichen Text einfügen, z.B. aus E-Mails oder Protokollen..."
+        placeholder="Hier können Sie zusätzlichen Text einfügen..."
     )
 
 st.divider()
@@ -315,82 +370,98 @@ st.divider()
 # --- Schritt 2: Verarbeitung ---
 st.header("2️⃣ Informationen extrahieren")
 
-# Optionen für Bildkomprimierung
 with st.expander("⚙️ Erweiterte Optionen"):
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         max_image_size = st.slider(
-            "Max. Bildgröße (Pixel)",
+            "Max. Bildgröße (px)",
             min_value=512,
             max_value=2048,
             value=1024,
             step=256,
-            help="Kleinere Bilder = weniger Token = schneller & günstiger"
+            help="Kleinere Bilder = weniger Tokens"
         )
     with col2:
-        max_retries = st.slider(
-            "Max. Wiederholungsversuche",
+        chunk_size = st.slider(
+            "Bilder pro Chunk",
             min_value=1,
             max_value=5,
             value=3,
-            help="Wie oft bei API-Limit automatisch erneut versucht werden soll"
+            help="Weniger = sicherer, mehr = schneller"
+        )
+    with col3:
+        chunk_delay = st.slider(
+            "Pause zwischen Chunks (Sek.)",
+            min_value=30,
+            max_value=120,
+            value=65,
+            help="Mindestens 60 Sekunden empfohlen"
         )
 
 if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True):
     if not uploaded_files and not manual_text:
         st.error("Bitte laden Sie mindestens eine Datei hoch oder geben Sie Text ein.")
     else:
-        with st.spinner("Analysiere Unterlagen mit Gemini..."):
-            try:
-                # Text aus PDFs und Word-Dokumenten extrahieren
-                extracted_text = manual_text or ""
+        try:
+            status = st.empty()
+            
+            # --- Text aus PDFs und Word extrahieren ---
+            extracted_text = manual_text or ""
+            
+            for f in uploaded_files:
+                f.seek(0)
+                if f.type == 'application/pdf':
+                    status.text(f"📄 Extrahiere Text aus {f.name}...")
+                    extracted_text += "\n\n--- PDF: " + f.name + " ---\n" + extract_text_from_pdf(f)
+                elif f.type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+                    status.text(f"📝 Extrahiere Text aus {f.name}...")
+                    extracted_text += "\n\n--- Word: " + f.name + " ---\n" + extract_text_from_docx(f)
+            
+            # --- Bilder vorbereiten und komprimieren ---
+            pil_images = []
+            image_files = [f for f in uploaded_files if f.type.startswith('image/')]
+            
+            for i, f in enumerate(image_files):
+                f.seek(0)
+                status.text(f"🖼️ Komprimiere Bild {i+1}/{len(image_files)}: {f.name}...")
+                img = Image.open(f)
+                img = compress_image(img, max_size=max_image_size)
+                pil_images.append(img)
+            
+            status.empty()
+            
+            # --- Verarbeitung je nach Anzahl ---
+            if len(pil_images) <= 3:
+                # Wenige Bilder: Alles auf einmal
+                st.info("📤 Sende alle Dokumente an Gemini...")
                 
-                # Status-Updates
-                status = st.empty()
+                contents = [EXTRACTION_PROMPT]
+                if extracted_text:
+                    contents.append(f"TEXTUELLE INFORMATIONEN:\n{extracted_text}\n\n")
+                contents.append("GESCANNTE DOKUMENTE:")
+                for img in pil_images:
+                    contents.append(img)
                 
-                # PDFs und Word-Dokumente verarbeiten
-                for f in uploaded_files:
-                    f.seek(0)
-                    if f.type == 'application/pdf':
-                        status.text(f"📄 Extrahiere Text aus {f.name}...")
-                        extracted_text += "\n\n--- PDF-DOKUMENT ---\n" + extract_text_from_pdf(f)
-                    elif f.type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-                        status.text(f"📝 Extrahiere Text aus {f.name}...")
-                        extracted_text += "\n\n--- WORD-DOKUMENT ---\n" + extract_text_from_docx(f)
+                result = call_gemini_safe(contents)
+            
+            else:
+                # Viele Bilder: Chunk-Verarbeitung
+                st.warning(f"📦 Starte Chunk-Verarbeitung für {len(pil_images)} Bilder...")
                 
-                # Bilder vorbereiten (MIT KOMPRIMIERUNG)
-                pil_images = []
-                image_count = len([f for f in uploaded_files if f.type.startswith('image/')])
+                extracted_parts = process_images_in_chunks(
+                    pil_images, 
+                    chunk_size=chunk_size, 
+                    delay_between_chunks=chunk_delay
+                )
                 
-                for i, f in enumerate(uploaded_files):
-                    f.seek(0)
-                    if f.type.startswith('image/'):
-                        status.text(f"🖼️ Komprimiere Bild {i+1}/{image_count}: {f.name}...")
-                        img = Image.open(f)
-                        
-                        # Komprimierung anwenden
-                        original_size = f"{img.width}x{img.height}"
-                        img = compress_image(img, max_size=max_image_size)
-                        new_size = f"{img.width}x{img.height}"
-                        
-                        pil_images.append(img)
-                
-                status.text("🤖 Sende an Gemini API...")
-                
-                # Extraktion mit Retry-Logik
-                if pil_images and extracted_text:
-                    result = extract_info_combined(pil_images, extracted_text)
-                elif pil_images:
-                    result = extract_info_from_images(pil_images)
-                else:
-                    result = extract_info_from_text(extracted_text)
-                
-                status.empty()
-                st.session_state["extracted_content"] = result
-                st.success("✅ Analyse abgeschlossen!")
-                
-            except Exception as e:
-                st.error(f"Fehler bei der Analyse: {str(e)}")
+                st.info("🔗 Kombiniere alle Teilergebnisse...")
+                result = combine_extracted_parts(extracted_parts, extracted_text)
+            
+            st.session_state["extracted_content"] = result
+            st.success("✅ Analyse abgeschlossen!")
+            
+        except Exception as e:
+            st.error(f"Fehler bei der Analyse: {str(e)}")
 
 st.divider()
 
@@ -402,7 +473,7 @@ if "extracted_content" in st.session_state:
         "Extrahiertes Exposé (bearbeitbar):",
         value=st.session_state["extracted_content"],
         height=400,
-        help="Hier können Sie den Text anpassen, bevor Sie das PDF erstellen."
+        help="Hier können Sie den Text anpassen."
     )
     
     st.session_state["edited_content"] = edited_content
@@ -424,7 +495,7 @@ if "extracted_content" in st.session_state:
     with col2:
         st.write("")
         st.write("")
-        if st.button("📥 PDF erstellen & herunterladen", type="primary"):
+        if st.button("📥 PDF erstellen", type="primary"):
             try:
                 pdf_buffer = create_pdf(edited_content)
                 
@@ -443,4 +514,4 @@ else:
 
 # --- Footer ---
 st.divider()
-st.caption("🔒 Hinweis: Die hochgeladenen Daten werden nur temporär verarbeitet und nicht gespeichert.")
+st.caption("🔒 Die hochgeladenen Daten werden nur temporär verarbeitet und nicht gespeichert.")
