@@ -1,5 +1,5 @@
-# app.py - Casting Exposé Generator v1.7
-# Mit schönerem PDF-Design und gemini-2.5-flash-preview
+# app.py - Casting Exposé Generator v2.0
+# Mit Hintergrundbild und Design wie im Entwurf
 
 import streamlit as st
 import google.generativeai as genai
@@ -7,14 +7,12 @@ from PIL import Image
 import io
 import time
 import re
+import os
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm, mm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.pdfgen import canvas
-from reportlab.platypus import BaseDocTemplate, Frame, PageTemplate
+from reportlab.lib.utils import ImageReader
 import fitz
 from docx import Document
 
@@ -27,55 +25,52 @@ st.set_page_config(
 
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-3-flash-preview")
+model = genai.GenerativeModel("gemini-2.5-flash-preview-04-17")
 
-# --- Farben (angelehnt an den Entwurf) ---
+# --- Farben (wie im Entwurf) ---
 COLORS = {
-    'primary_green': colors.HexColor('#4A7C23'),      # Dunkelgrün für Titel
-    'light_green': colors.HexColor('#E8F5E9'),        # Hellgrün für Hintergrund
-    'accent_green': colors.HexColor('#81C784'),       # Akzentgrün
-    'header_bg': colors.HexColor('#2E7D32'),          # Header-Hintergrund
-    'section_bg': colors.HexColor('#F1F8E9'),         # Section-Hintergrund
-    'text_dark': colors.HexColor('#1B5E20'),          # Dunkler Text
-    'text_body': colors.HexColor('#333333'),          # Body-Text
-    'white': colors.white,
-    'border': colors.HexColor('#A5D6A7'),             # Rahmenfarbe
+    'title_green': (78, 124, 35),           # Dunkelgrün für Titel
+    'section_header_bg': (101, 148, 58),    # Grün für Section-Header
+    'section_header_text': (255, 255, 255), # Weiß
+    'box_bg': (255, 255, 255, 200),         # Weiß, leicht transparent
+    'text_dark': (51, 51, 51),              # Dunkler Text
+    'budget_green': (46, 125, 50),          # Budget-Grün
 }
 
 # --- Prompts ---
 EXTRACTION_PROMPT = """
 Analysiere diese Casting-Unterlagen und extrahiere ALLE relevanten Informationen.
 
-Erstelle ein kompaktes Exposé mit EXAKT dieser Struktur (verwende genau diese Überschriften):
+Erstelle ein kompaktes Exposé mit EXAKT dieser Struktur:
 
-## FAMILIENNAME AUS ORT
+FAMILIENNAME|||ORT
 
-**Familienmitglieder:**
+FAMILIENMITGLIEDER:
 - Name (Alter), Beruf
 - Name (Alter), Beruf
-(für jede Person eine Zeile)
 
-**Fakten zum Garten:**
+FAKTEN ZUM GARTEN:
 - Größe: X m²
 - Besonderheiten: ...
 
-**Budget:** X €
+BUDGET: X €
 
-**Wünsche für den Garten:**
+WÜNSCHE FÜR DEN GARTEN:
 - Wunsch 1
 - Wunsch 2
 - Wunsch 3
 
-**Die Familie / Hintergrund:**
-2-3 Sätze zur Familie und warum sie den Garten umgestalten wollen.
+DIE FAMILIE / HINTERGRUND:
+2-3 Sätze zur Familie.
 
-**Besonderheiten / Notizen:**
-TV-Erfahrung, Termine, Einschränkungen (falls vorhanden)
+BESONDERHEITEN / NOTIZEN:
+Falls vorhanden, sonst weglassen.
 
 WICHTIG:
 - Schreibe auf Deutsch
 - Kurz und prägnant
-- Keine Einleitung, direkt mit ## FAMILIENNAME beginnen
+- Erste Zeile MUSS sein: FAMILIENNAME|||ORT (z.B. MÜLLER|||KÖLN)
+- Keine Einleitung
 - Ignoriere Datenschutzerklärungen
 """
 
@@ -93,28 +88,29 @@ Kombiniere diese extrahierten Informationen zu EINEM kompakten Exposé:
 
 Verwende EXAKT diese Struktur:
 
-## FAMILIENNAME AUS ORT
+FAMILIENNAME|||ORT
 
-**Familienmitglieder:**
+FAMILIENMITGLIEDER:
 - Name (Alter), Beruf
 
-**Fakten zum Garten:**
+FAKTEN ZUM GARTEN:
 - Größe: X m²
 - Besonderheiten: ...
 
-**Budget:** X €
+BUDGET: X €
 
-**Wünsche für den Garten:**
+WÜNSCHE FÜR DEN GARTEN:
 - Wunsch 1
 - Wunsch 2
 
-**Die Familie / Hintergrund:**
+DIE FAMILIE / HINTERGRUND:
 2-3 Sätze
 
-**Besonderheiten / Notizen:**
+BESONDERHEITEN / NOTIZEN:
 Falls vorhanden
 
-Keine Einleitung, direkt mit ## beginnen. Kurz, prägnant, auf Deutsch.
+Erste Zeile MUSS sein: FAMILIENNAME|||ORT
+Kurz, prägnant, auf Deutsch.
 """
 
 # --- Hilfsfunktionen ---
@@ -125,10 +121,8 @@ def compress_image(image, max_size=800):
     if ratio < 1:
         new_size = (int(image.width * ratio), int(image.height * ratio))
         image = image.resize(new_size, Image.LANCZOS)
-    
     if image.mode in ('RGBA', 'P'):
         image = image.convert('RGB')
-    
     return image
 
 
@@ -156,28 +150,23 @@ def wait_with_countdown(seconds, message="Warte"):
     """Zeigt einen Countdown"""
     if seconds <= 0:
         return
-    
     progress_bar = st.progress(0)
     countdown_text = st.empty()
-    
     for i in range(seconds):
         remaining = seconds - i
         countdown_text.text(f"⏱️ {message}... {remaining}s")
         progress_bar.progress((i + 1) / seconds)
         time.sleep(1)
-    
     countdown_text.empty()
     progress_bar.empty()
 
 
 def is_rate_limit_error(error):
-    """Prüft ob es ein Rate-Limit-Fehler ist"""
     error_str = str(error).lower()
     return "429" in error_str or "quota" in error_str or "rate" in error_str or "limit" in error_str
 
 
 def get_retry_delay(error):
-    """Extrahiert Wartezeit aus Fehlermeldung"""
     match = re.search(r'retry_delay.*?(\d+)', str(error))
     if match:
         return int(match.group(1)) + 5
@@ -185,13 +174,11 @@ def get_retry_delay(error):
 
 
 def call_gemini(contents):
-    """Einfacher Gemini-Aufruf"""
     response = model.generate_content(contents)
     return response.text
 
 
 def call_gemini_with_retry(contents, max_retries=3):
-    """Gemini-Aufruf mit Retry"""
     for attempt in range(max_retries):
         try:
             return call_gemini(contents)
@@ -208,7 +195,6 @@ def call_gemini_with_retry(contents, max_retries=3):
 # --- Adaptive Verarbeitung ---
 
 def strategy_all_at_once(images, additional_text=""):
-    """STUFE 1: Alle Bilder auf einmal"""
     contents = [EXTRACTION_PROMPT]
     if additional_text:
         contents.append(f"\n\nZusätzliche Infos:\n{additional_text}\n\n")
@@ -219,10 +205,8 @@ def strategy_all_at_once(images, additional_text=""):
 
 
 def strategy_in_batches(images, image_names, additional_text="", batch_size=3, delay=0):
-    """STUFE 2: In Gruppen"""
     extracted_parts = []
     total_batches = (len(images) + batch_size - 1) // batch_size
-    
     progress = st.progress(0)
     status = st.empty()
     
@@ -230,10 +214,8 @@ def strategy_in_batches(images, image_names, additional_text="", batch_size=3, d
         start_idx = batch_num * batch_size
         end_idx = min(start_idx + batch_size, len(images))
         batch_images = images[start_idx:end_idx]
-        batch_names = image_names[start_idx:end_idx]
         
         status.markdown(f"### 📦 Gruppe {batch_num + 1}/{total_batches}")
-        
         contents = [SINGLE_IMAGE_PROMPT]
         for img in batch_images:
             contents.append(img)
@@ -243,7 +225,6 @@ def strategy_in_batches(images, image_names, additional_text="", batch_size=3, d
             extracted_parts.append(f"--- Gruppe {batch_num + 1} ---\n{result}")
         
         progress.progress((batch_num + 1) / total_batches)
-        
         if delay > 0 and batch_num < total_batches - 1:
             wait_with_countdown(delay)
     
@@ -253,27 +234,21 @@ def strategy_in_batches(images, image_names, additional_text="", batch_size=3, d
     all_infos = "\n\n".join(extracted_parts)
     if additional_text:
         all_infos = f"--- Textdokumente ---\n{additional_text}\n\n{all_infos}"
-    
     return call_gemini_with_retry([COMBINE_PROMPT.format(extracted_infos=all_infos)])
 
 
 def strategy_one_by_one(images, image_names, additional_text="", delay=0):
-    """STUFE 3: Einzeln"""
     extracted_parts = []
     total = len(images)
-    
     progress = st.progress(0)
     status = st.empty()
     
     for i, (img, name) in enumerate(zip(images, image_names)):
         status.markdown(f"### 🖼️ Bild {i+1}/{total}: `{name}`")
-        
         result = call_gemini_with_retry([SINGLE_IMAGE_PROMPT, img])
         if result:
             extracted_parts.append(f"--- Bild {i+1} ---\n{result}")
-        
         progress.progress((i + 1) / total)
-        
         if delay > 0 and i < total - 1:
             wait_with_countdown(delay)
     
@@ -283,12 +258,10 @@ def strategy_one_by_one(images, image_names, additional_text="", delay=0):
     all_infos = "\n\n".join(extracted_parts)
     if additional_text:
         all_infos = f"--- Textdokumente ---\n{additional_text}\n\n{all_infos}"
-    
     return call_gemini_with_retry([COMBINE_PROMPT.format(extracted_infos=all_infos)])
 
 
 def process_adaptive(images, image_names, additional_text="", delay=0):
-    """Adaptive Verarbeitung"""
     num_images = len(images)
     
     if num_images == 1:
@@ -298,7 +271,6 @@ def process_adaptive(images, image_names, additional_text="", delay=0):
             contents.append(f"\n\nZusätzliche Infos:\n{additional_text}")
         return call_gemini_with_retry(contents)
     
-    # STUFE 1
     st.info(f"🚀 **Stufe 1:** Alle {num_images} Bilder auf einmal...")
     try:
         result = strategy_all_at_once(images, additional_text)
@@ -311,7 +283,6 @@ def process_adaptive(images, image_names, additional_text="", delay=0):
         else:
             raise e
     
-    # STUFE 2
     if num_images > 3:
         st.info("📦 **Stufe 2:** 3er-Gruppen...")
         try:
@@ -325,210 +296,318 @@ def process_adaptive(images, image_names, additional_text="", delay=0):
             else:
                 raise e
     
-    # STUFE 3
     st.info("🐢 **Stufe 3:** Einzeln...")
     result = strategy_one_by_one(images, image_names, additional_text, delay=max(delay, 5))
     st.success("✅ Stufe 3 erfolgreich!")
     return result
 
 
-# --- PDF-Erstellung (NEUES DESIGN) ---
+# --- PDF-Erstellung mit Hintergrundbild ---
 
-def draw_page_background(canvas, doc):
-    """Zeichnet den Seitenhintergrund"""
-    width, height = A4
+def parse_content(content):
+    """Parst den KI-Output in strukturierte Daten"""
+    data = {
+        'family_name': 'FAMILIE',
+        'city': 'ORT',
+        'members': [],
+        'garden_facts': [],
+        'budget': '',
+        'wishes': [],
+        'background': '',
+        'notes': ''
+    }
     
-    # Header-Bereich (grüner Balken oben)
-    canvas.setFillColor(COLORS['header_bg'])
-    canvas.rect(0, height - 2.5*cm, width, 2.5*cm, fill=True, stroke=False)
-    
-    # Subtiler grüner Rand unten
-    canvas.setFillColor(COLORS['accent_green'])
-    canvas.rect(0, 0, width, 0.5*cm, fill=True, stroke=False)
-    
-    # Linker Akzentstreifen
-    canvas.setFillColor(COLORS['light_green'])
-    canvas.rect(0, 0.5*cm, 0.5*cm, height - 3*cm, fill=True, stroke=False)
-
-
-def create_styled_pdf(content, show_name="Duell der Gartenprofis"):
-    """Erstellt ein schön gestaltetes PDF"""
-    buffer = io.BytesIO()
-    
-    # Dokument mit custom PageTemplate
-    doc = BaseDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=1.5*cm,
-        leftMargin=1.5*cm,
-        topMargin=3.5*cm,
-        bottomMargin=1.5*cm
-    )
-    
-    # Frame für den Inhalt
-    frame = Frame(
-        doc.leftMargin,
-        doc.bottomMargin,
-        doc.width,
-        doc.height,
-        id='normal'
-    )
-    
-    # PageTemplate mit Hintergrund
-    template = PageTemplate(
-        id='styled',
-        frames=frame,
-        onPage=draw_page_background
-    )
-    doc.addPageTemplates([template])
-    
-    # Styles definieren
-    styles = getSampleStyleSheet()
-    
-    # Showname im Header
-    show_style = ParagraphStyle(
-        'ShowName',
-        parent=styles['Normal'],
-        fontSize=14,
-        textColor=COLORS['white'],
-        alignment=TA_CENTER,
-        fontName='Helvetica-Bold',
-        spaceAfter=0
-    )
-    
-    # Haupttitel (Familienname)
-    title_style = ParagraphStyle(
-        'MainTitle',
-        parent=styles['Heading1'],
-        fontSize=22,
-        textColor=COLORS['primary_green'],
-        alignment=TA_CENTER,
-        fontName='Helvetica-Bold',
-        spaceBefore=10,
-        spaceAfter=15,
-        borderWidth=0,
-        borderColor=COLORS['border'],
-        borderPadding=5
-    )
-    
-    # Section Headers
-    section_style = ParagraphStyle(
-        'SectionHeader',
-        parent=styles['Heading2'],
-        fontSize=13,
-        textColor=COLORS['text_dark'],
-        fontName='Helvetica-Bold',
-        spaceBefore=12,
-        spaceAfter=6,
-        borderWidth=0,
-        borderPadding=0,
-        underlineWidth=1,
-        underlineColor=COLORS['accent_green']
-    )
-    
-    # Body Text
-    body_style = ParagraphStyle(
-        'BodyText',
-        parent=styles['Normal'],
-        fontSize=10,
-        textColor=COLORS['text_body'],
-        fontName='Helvetica',
-        spaceAfter=4,
-        leading=14
-    )
-    
-    # Aufzählungen
-    bullet_style = ParagraphStyle(
-        'BulletPoint',
-        parent=body_style,
-        leftIndent=15,
-        bulletIndent=5,
-        spaceAfter=3
-    )
-    
-    # Budget (hervorgehoben)
-    budget_style = ParagraphStyle(
-        'Budget',
-        parent=styles['Normal'],
-        fontSize=12,
-        textColor=COLORS['primary_green'],
-        fontName='Helvetica-Bold',
-        spaceBefore=8,
-        spaceAfter=8,
-        backColor=COLORS['light_green'],
-        borderWidth=1,
-        borderColor=COLORS['border'],
-        borderPadding=8,
-        borderRadius=3
-    )
-    
-    # Story aufbauen
-    story = []
-    
-    # Content parsen
-    lines = content.split('\n')
+    lines = content.strip().split('\n')
     current_section = None
     
     for line in lines:
         line = line.strip()
-        
         if not line:
-            story.append(Spacer(1, 4))
             continue
         
-        # Haupttitel (## FAMILIENNAME)
-        if line.startswith('## '):
-            title_text = line[3:].strip()
-            story.append(Paragraph(title_text, title_style))
-            story.append(Spacer(1, 10))
+        # Erste Zeile: FAMILIENNAME|||ORT
+        if '|||' in line:
+            parts = line.split('|||')
+            data['family_name'] = parts[0].strip()
+            data['city'] = parts[1].strip() if len(parts) > 1 else ''
             continue
         
-        # Section Header (**Überschrift:**)
-        if line.startswith('**') and line.endswith(':**'):
-            section_text = line[2:-3].strip()
-            
-            # Dekorative Linie vor Section
-            story.append(Spacer(1, 8))
-            
-            # Section mit Unterstrich-Effekt
-            section_html = f'<u>{section_text}:</u>'
-            story.append(Paragraph(section_html, section_style))
-            current_section = section_text.lower()
+        # Section Headers
+        line_upper = line.upper()
+        if 'FAMILIENMITGLIEDER' in line_upper:
+            current_section = 'members'
+            continue
+        elif 'FAKTEN ZUM GARTEN' in line_upper:
+            current_section = 'garden'
+            continue
+        elif line_upper.startswith('BUDGET'):
+            # Budget direkt extrahieren
+            budget_match = re.search(r'[\d.,]+\s*€?', line)
+            if budget_match:
+                data['budget'] = budget_match.group(0).strip()
+            current_section = None
+            continue
+        elif 'WÜNSCHE' in line_upper:
+            current_section = 'wishes'
+            continue
+        elif 'HINTERGRUND' in line_upper or 'FAMILIE' in line_upper:
+            current_section = 'background'
+            continue
+        elif 'BESONDERHEITEN' in line_upper or 'NOTIZEN' in line_upper:
+            current_section = 'notes'
             continue
         
-        # Section Header alternative (**Überschrift**)
-        if line.startswith('**') and line.endswith('**') and ':**' not in line:
-            section_text = line[2:-2].strip()
-            story.append(Spacer(1, 8))
-            story.append(Paragraph(f'<u>{section_text}</u>', section_style))
-            continue
-        
-        # Budget (spezielle Formatierung)
-        if line.lower().startswith('**budget'):
-            budget_text = line.replace('**', '').strip()
-            story.append(Paragraph(f'💰 {budget_text}', budget_style))
-            continue
-        
-        # Aufzählungspunkte
-        if line.startswith('- ') or line.startswith('• ') or line.startswith('* '):
-            bullet_text = line[2:].strip()
-            # Fett-Formatierung erhalten
-            bullet_text = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', bullet_text)
-            story.append(Paragraph(f'• {bullet_text}', bullet_style))
-            continue
-        
-        # Inline **fett** ersetzen
-        if '**' in line:
-            line = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', line)
-        
-        # Normaler Text
-        story.append(Paragraph(line, body_style))
+        # Content zu Sections hinzufügen
+        if current_section == 'members' and line.startswith('-'):
+            data['members'].append(line[1:].strip())
+        elif current_section == 'garden' and line.startswith('-'):
+            data['garden_facts'].append(line[1:].strip())
+        elif current_section == 'wishes' and line.startswith('-'):
+            data['wishes'].append(line[1:].strip())
+        elif current_section == 'background':
+            data['background'] += line + ' '
+        elif current_section == 'notes':
+            data['notes'] += line + ' '
     
-    # Footer-Spacer
-    story.append(Spacer(1, 20))
+    data['background'] = data['background'].strip()
+    data['notes'] = data['notes'].strip()
     
-    # PDF bauen
-    doc.build(story)
+    return data
+
+
+def draw_rounded_rect(c, x, y, width, height, radius, fill_color=None, stroke_color=None, alpha=1):
+    """Zeichnet ein Rechteck mit abgerundeten Ecken"""
+    c.saveState()
+    
+    if fill_color:
+        if len(fill_color) == 4:  # RGBA
+            c.setFillColorRGB(fill_color[0]/255, fill_color[1]/255, fill_color[2]/255, fill_color[3]/255)
+        else:
+            c.setFillColorRGB(fill_color[0]/255, fill_color[1]/255, fill_color[2]/255, alpha)
+    
+    if stroke_color:
+        c.setStrokeColorRGB(stroke_color[0]/255, stroke_color[1]/255, stroke_color[2]/255)
+        c.setLineWidth(1)
+    
+    # Pfad für abgerundetes Rechteck
+    p = c.beginPath()
+    p.moveTo(x + radius, y)
+    p.lineTo(x + width - radius, y)
+    p.arcTo(x + width - radius, y, x + width, y + radius, radius)
+    p.lineTo(x + width, y + height - radius)
+    p.arcTo(x + width, y + height - radius, x + width - radius, y + height, radius)
+    p.lineTo(x + radius, y + height)
+    p.arcTo(x + radius, y + height, x, y + height - radius, radius)
+    p.lineTo(x, y + radius)
+    p.arcTo(x, y + radius, x + radius, y, radius)
+    p.close()
+    
+    if fill_color and stroke_color:
+        c.drawPath(p, fill=1, stroke=1)
+    elif fill_color:
+        c.drawPath(p, fill=1, stroke=0)
+    elif stroke_color:
+        c.drawPath(p, fill=0, stroke=1)
+    
+    c.restoreState()
+
+
+def draw_section_header(c, x, y, text, width=None):
+    """Zeichnet einen Section-Header wie im Entwurf"""
+    c.saveState()
+    
+    # Textbreite berechnen
+    c.setFont("Helvetica-Bold", 11)
+    text_width = c.stringWidth(text, "Helvetica-Bold", 11)
+    box_width = text_width + 16 if width is None else width
+    box_height = 20
+    
+    # Grüner Hintergrund
+    draw_rounded_rect(c, x, y - box_height + 5, box_width, box_height, 3, 
+                      fill_color=COLORS['section_header_bg'])
+    
+    # Weißer Text
+    c.setFillColorRGB(1, 1, 1)
+    c.drawString(x + 8, y - 10, text)
+    
+    c.restoreState()
+    return box_height
+
+
+def draw_content_box(c, x, y, width, height, alpha=0.85):
+    """Zeichnet eine weiße, leicht transparente Box"""
+    draw_rounded_rect(c, x, y, width, height, 5, 
+                      fill_color=(255, 255, 255), alpha=alpha)
+
+
+def draw_text_block(c, x, y, lines, font="Helvetica", size=10, line_height=14, color=(51, 51, 51)):
+    """Zeichnet mehrere Textzeilen"""
+    c.saveState()
+    c.setFont(font, size)
+    c.setFillColorRGB(color[0]/255, color[1]/255, color[2]/255)
+    
+    current_y = y
+    for line in lines:
+        c.drawString(x, current_y, line)
+        current_y -= line_height
+    
+    c.restoreState()
+    return y - current_y
+
+
+def create_styled_pdf_with_background(content, background_image_path=None):
+    """Erstellt das PDF mit Hintergrundbild wie im Entwurf"""
+    buffer = io.BytesIO()
+    
+    width, height = A4
+    c = canvas.Canvas(buffer, pagesize=A4)
+    
+    # Daten parsen
+    data = parse_content(content)
+    
+    # --- Hintergrundbild ---
+    if background_image_path and os.path.exists(background_image_path):
+        try:
+            c.drawImage(background_image_path, 0, 0, width=width, height=height, 
+                       preserveAspectRatio=False, mask='auto')
+        except:
+            pass  # Falls Bild nicht geladen werden kann
+    
+    # --- Titel im Header-Bereich ---
+    # Position: Im oberen Bereich, unterhalb der Logos
+    title_y = height - 85
+    title_text = f"EXPOSÉ FAMILIE {data['family_name']} AUS {data['city']}"
+    
+    c.setFont("Helvetica-Bold", 18)
+    c.setFillColorRGB(COLORS['title_green'][0]/255, 
+                      COLORS['title_green'][1]/255, 
+                      COLORS['title_green'][2]/255)
+    
+    # Titel zentrieren
+    title_width = c.stringWidth(title_text, "Helvetica-Bold", 18)
+    c.drawString((width - title_width) / 2, title_y, title_text)
+    
+    # --- Content-Bereich ---
+    margin_left = 25
+    margin_right = 25
+    content_width = width - margin_left - margin_right
+    
+    current_y = height - 120  # Start unterhalb des Headers
+    
+    # --- Familienmitglieder ---
+    if data['members']:
+        box_height = len(data['members']) * 16 + 30
+        draw_content_box(c, margin_left, current_y - box_height, content_width, box_height)
+        draw_section_header(c, margin_left + 5, current_y - 5, "Familienmitglieder:")
+        
+        c.setFont("Helvetica", 10)
+        c.setFillColorRGB(0.2, 0.2, 0.2)
+        text_y = current_y - 30
+        for member in data['members']:
+            # Fett-Formatierung für Namen
+            member_clean = member.replace('**', '')
+            c.drawString(margin_left + 15, text_y, f"• {member_clean}")
+            text_y -= 16
+        
+        current_y -= box_height + 10
+    
+    # --- Fakten zum Garten ---
+    if data['garden_facts'] or data['budget']:
+        facts_lines = data['garden_facts'].copy()
+        if data['budget']:
+            facts_lines.append(f"Budget: {data['budget']} €")
+        
+        box_height = len(facts_lines) * 16 + 30
+        draw_content_box(c, margin_left, current_y - box_height, content_width, box_height)
+        draw_section_header(c, margin_left + 5, current_y - 5, "Fakten zum Garten:")
+        
+        c.setFont("Helvetica", 10)
+        c.setFillColorRGB(0.2, 0.2, 0.2)
+        text_y = current_y - 30
+        for fact in facts_lines:
+            c.drawString(margin_left + 15, text_y, f"• {fact}")
+            text_y -= 16
+        
+        current_y -= box_height + 10
+    
+    # --- Wünsche für den Garten ---
+    if data['wishes']:
+        box_height = len(data['wishes']) * 16 + 30
+        draw_content_box(c, margin_left, current_y - box_height, content_width, box_height)
+        draw_section_header(c, margin_left + 5, current_y - 5, "Wünsche für den Garten:")
+        
+        c.setFont("Helvetica", 10)
+        c.setFillColorRGB(0.2, 0.2, 0.2)
+        text_y = current_y - 30
+        for wish in data['wishes']:
+            wish_clean = wish.replace('**', '')
+            c.drawString(margin_left + 15, text_y, f"• {wish_clean}")
+            text_y -= 16
+        
+        current_y -= box_height + 10
+    
+    # --- Die Familie / Hintergrund ---
+    if data['background']:
+        # Text umbrechen
+        c.setFont("Helvetica", 10)
+        words = data['background'].split()
+        lines = []
+        current_line = ""
+        max_width = content_width - 30
+        
+        for word in words:
+            test_line = current_line + " " + word if current_line else word
+            if c.stringWidth(test_line, "Helvetica", 10) < max_width:
+                current_line = test_line
+            else:
+                if current_line:
+                    lines.append(current_line)
+                current_line = word
+        if current_line:
+            lines.append(current_line)
+        
+        box_height = len(lines) * 14 + 35
+        draw_content_box(c, margin_left, current_y - box_height, content_width, box_height)
+        draw_section_header(c, margin_left + 5, current_y - 5, "Die Familie / Hintergrund:")
+        
+        c.setFillColorRGB(0.2, 0.2, 0.2)
+        text_y = current_y - 30
+        for line in lines:
+            c.drawString(margin_left + 15, text_y, line)
+            text_y -= 14
+        
+        current_y -= box_height + 10
+    
+    # --- Besonderheiten / Notizen ---
+    if data['notes']:
+        c.setFont("Helvetica", 10)
+        words = data['notes'].split()
+        lines = []
+        current_line = ""
+        max_width = content_width - 30
+        
+        for word in words:
+            test_line = current_line + " " + word if current_line else word
+            if c.stringWidth(test_line, "Helvetica", 10) < max_width:
+                current_line = test_line
+            else:
+                if current_line:
+                    lines.append(current_line)
+                current_line = word
+        if current_line:
+            lines.append(current_line)
+        
+        box_height = len(lines) * 14 + 35
+        draw_content_box(c, margin_left, current_y - box_height, content_width, box_height)
+        draw_section_header(c, margin_left + 5, current_y - 5, "Besonderheiten / Notizen:")
+        
+        c.setFillColorRGB(0.2, 0.2, 0.2)
+        text_y = current_y - 30
+        for line in lines:
+            c.drawString(margin_left + 15, text_y, line)
+            text_y -= 14
+    
+    c.save()
     buffer.seek(0)
     return buffer
 
@@ -570,13 +649,11 @@ st.divider()
 st.header("2️⃣ Informationen extrahieren")
 
 with st.expander("⚙️ Optionen"):
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         max_image_size = st.slider("Bildgröße (px)", 512, 1024, 800, 128)
     with col2:
         fallback_delay = st.slider("Pause bei Fallback (Sek.)", 0, 60, 5, 5)
-    with col3:
-        show_name = st.text_input("Show-Name (für PDF)", value="Duell der Gartenprofis")
 
 if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True):
     if not uploaded_files and not manual_text:
@@ -612,7 +689,6 @@ if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True
                 result = process_adaptive(pil_images, image_names, extracted_text, delay=fallback_delay)
             
             st.session_state["extracted_content"] = result
-            st.session_state["show_name"] = show_name
             st.success("✅ Analyse abgeschlossen!")
             st.balloons()
             
@@ -643,10 +719,13 @@ if "extracted_content" in st.session_state:
         st.write("")
         if st.button("📥 PDF erstellen", type="primary"):
             try:
-                pdf_buffer = create_styled_pdf(
-                    edited_content, 
-                    show_name=st.session_state.get("show_name", "Duell der Gartenprofis")
-                )
+                # Hintergrundbild-Pfad
+                bg_path = "Background.jpg"
+                if not os.path.exists(bg_path):
+                    bg_path = None
+                    st.warning("⚠️ Hintergrundbild nicht gefunden. PDF wird ohne Hintergrund erstellt.")
+                
+                pdf_buffer = create_styled_pdf_with_background(edited_content, bg_path)
                 st.download_button(
                     "⬇️ PDF herunterladen",
                     data=pdf_buffer,
@@ -656,9 +735,9 @@ if "extracted_content" in st.session_state:
             except Exception as e:
                 st.error(f"PDF-Fehler: {str(e)}")
     
-    # Vorschau
-    with st.expander("👁️ Text-Vorschau"):
-        st.markdown(edited_content)
+    with st.expander("👁️ Parsed Data Preview"):
+        data = parse_content(edited_content)
+        st.json(data)
 
 else:
     st.info("👆 Erst Unterlagen hochladen und Analyse starten.")
