@@ -1,5 +1,5 @@
-# app.py - Casting Exposé Generator v2.0
-# Mit Hintergrundbild und Design wie im Entwurf
+# app.py - Casting Exposé Generator v3.0
+# Mit Fotos, Familienbild-Erkennung, 2-Seiten-PDF
 
 import streamlit as st
 import google.generativeai as genai
@@ -8,6 +8,7 @@ import io
 import time
 import re
 import os
+import hashlib
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm, mm
 from reportlab.lib import colors
@@ -15,6 +16,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 import fitz
 from docx import Document
+import numpy as np
 
 # --- Konfiguration ---
 st.set_page_config(
@@ -27,31 +29,31 @@ GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-3-flash-preview")
 
-# --- Farben (wie im Entwurf) ---
+# --- Farben ---
 COLORS = {
-    'title_green': (78, 124, 35),           # Dunkelgrün für Titel
-    'section_header_bg': (101, 148, 58),    # Grün für Section-Header
-    'section_header_text': (255, 255, 255), # Weiß
-    'box_bg': (255, 255, 255, 200),         # Weiß, leicht transparent
-    'text_dark': (51, 51, 51),              # Dunkler Text
-    'budget_green': (46, 125, 50),          # Budget-Grün
+    'title_green': (78, 124, 35),
+    'section_header_bg': (101, 148, 58),
+    'section_header_text': (255, 255, 255),
+    'text_dark': (51, 51, 51),
+    'budget_green': (46, 125, 50),
 }
 
 # --- Prompts ---
 EXTRACTION_PROMPT = """
 Analysiere diese Casting-Unterlagen und extrahiere ALLE relevanten Informationen.
 
-Erstelle ein kompaktes Exposé mit EXAKT dieser Struktur:
+Erstelle ein Exposé mit EXAKT dieser Struktur:
 
 FAMILIENNAME|||ORT
 
 FAMILIENMITGLIEDER:
 - Name (Alter), Beruf
 - Name (Alter), Beruf
+(für jede Person eine Zeile)
 
 FAKTEN ZUM GARTEN:
 - Größe: X m²
-- Besonderheiten: ...
+- Besonderheiten: Details zum Garten, Zugang, Zustand etc.
 
 BUDGET: X €
 
@@ -59,28 +61,31 @@ WÜNSCHE FÜR DEN GARTEN:
 - Wunsch 1
 - Wunsch 2
 - Wunsch 3
+- Wunsch 4
 
 DIE FAMILIE / HINTERGRUND:
-2-3 Sätze zur Familie.
+Ausführlicher Text zur Familie (2-4 Sätze). Warum wollen sie den Garten umgestalten? Was ist ihre Geschichte?
 
 BESONDERHEITEN / NOTIZEN:
-Falls vorhanden, sonst weglassen.
+TV-Erfahrung, Termine, Einschränkungen, besondere Wünsche, Farbvorlieben etc.
 
 WICHTIG:
 - Schreibe auf Deutsch
-- Kurz und prägnant
+- Alle Informationen aus den Dokumenten übernehmen
 - Erste Zeile MUSS sein: FAMILIENNAME|||ORT (z.B. MÜLLER|||KÖLN)
-- Keine Einleitung
-- Ignoriere Datenschutzerklärungen
+- Keine Einleitung, direkt mit dem Namen beginnen
+- Ignoriere nur Datenschutzerklärungen
 """
 
 SINGLE_IMAGE_PROMPT = """
-Extrahiere ALLE Informationen aus diesem Dokument.
+Extrahiere ALLE Informationen aus diesem Dokument vollständig.
 Schreibe auf Deutsch. Bei unleserlichem Text: [unleserlich].
+Keine Information weglassen.
 """
 
 COMBINE_PROMPT = """
-Kombiniere diese extrahierten Informationen zu EINEM kompakten Exposé:
+Kombiniere diese extrahierten Informationen zu EINEM vollständigen Exposé.
+ALLE Informationen müssen enthalten sein, nichts weglassen!
 
 {extracted_infos}
 
@@ -95,22 +100,41 @@ FAMILIENMITGLIEDER:
 
 FAKTEN ZUM GARTEN:
 - Größe: X m²
-- Besonderheiten: ...
+- Besonderheiten: Alle Details
 
 BUDGET: X €
 
 WÜNSCHE FÜR DEN GARTEN:
-- Wunsch 1
-- Wunsch 2
+- Alle Wünsche auflisten
 
 DIE FAMILIE / HINTERGRUND:
-2-3 Sätze
+Ausführlicher Text (2-4 Sätze)
 
 BESONDERHEITEN / NOTIZEN:
-Falls vorhanden
+Alle zusätzlichen Infos
 
-Erste Zeile MUSS sein: FAMILIENNAME|||ORT
-Kurz, prägnant, auf Deutsch.
+Erste Zeile: FAMILIENNAME|||ORT
+Nichts weglassen! Auf Deutsch.
+"""
+
+PHOTO_ANALYSIS_PROMPT = """
+Analysiere diese Fotos und kategorisiere sie.
+
+Für jedes Foto, antworte mit einer Zeile im Format:
+FOTO_INDEX|KATEGORIE|BESCHREIBUNG
+
+Kategorien:
+- FAMILIE: Foto zeigt Menschen/Familie/Personen
+- GARTEN: Foto zeigt Garten, Pflanzen, Außenbereich
+- HAUS: Foto zeigt Haus, Gebäude
+- SONSTIGES: Andere Motive
+
+Beispiel:
+1|FAMILIE|Familienfoto mit 5 Personen im Garten
+2|GARTEN|Blick auf Terrasse mit altem Holzbelag
+3|GARTEN|Rasen mit Wäscheständer
+
+Analysiere jetzt diese Fotos:
 """
 
 # --- Hilfsfunktionen ---
@@ -124,6 +148,41 @@ def compress_image(image, max_size=800):
     if image.mode in ('RGBA', 'P'):
         image = image.convert('RGB')
     return image
+
+
+def get_image_hash(image, hash_size=8):
+    """Berechnet einen perceptual Hash für Duplikat-Erkennung"""
+    img = image.copy()
+    img = img.convert('L')  # Graustufen
+    img = img.resize((hash_size + 1, hash_size), Image.LANCZOS)
+    pixels = list(img.getdata())
+    
+    diff = []
+    for row in range(hash_size):
+        for col in range(hash_size):
+            left = pixels[row * (hash_size + 1) + col]
+            right = pixels[row * (hash_size + 1) + col + 1]
+            diff.append(left > right)
+    
+    return tuple(diff)
+
+
+def hamming_distance(hash1, hash2):
+    """Berechnet Hamming-Distanz zwischen zwei Hashes"""
+    return sum(a != b for a, b in zip(hash1, hash2))
+
+
+def find_duplicates(images, threshold=10):
+    """Findet ähnliche/doppelte Bilder"""
+    hashes = [get_image_hash(img) for img in images]
+    duplicates = set()
+    
+    for i in range(len(hashes)):
+        for j in range(i + 1, len(hashes)):
+            if hamming_distance(hashes[i], hashes[j]) < threshold:
+                duplicates.add(j)  # Markiere das spätere Bild als Duplikat
+    
+    return duplicates
 
 
 def extract_text_from_pdf(pdf_file):
@@ -190,6 +249,59 @@ def call_gemini_with_retry(contents, max_retries=3):
             else:
                 raise e
     return None
+
+
+# --- Foto-Analyse ---
+
+def analyze_photos(images):
+    """Analysiert Fotos und kategorisiert sie"""
+    if not images:
+        return [], None, []
+    
+    # Duplikate finden
+    duplicates = find_duplicates(images)
+    
+    # Fotos ohne Duplikate
+    unique_indices = [i for i in range(len(images)) if i not in duplicates]
+    
+    # KI-Analyse für Kategorisierung
+    try:
+        contents = [PHOTO_ANALYSIS_PROMPT]
+        for i, idx in enumerate(unique_indices):
+            contents.append(images[idx])
+        
+        response = call_gemini_with_retry(contents)
+        
+        # Response parsen
+        categories = {}
+        family_photo_idx = None
+        
+        for line in response.strip().split('\n'):
+            if '|' in line:
+                parts = line.split('|')
+                if len(parts) >= 2:
+                    try:
+                        photo_idx = int(parts[0].strip()) - 1
+                        category = parts[1].strip().upper()
+                        
+                        if photo_idx < len(unique_indices):
+                            real_idx = unique_indices[photo_idx]
+                            categories[real_idx] = category
+                            
+                            # Erstes Familienfoto merken
+                            if category == 'FAMILIE' and family_photo_idx is None:
+                                family_photo_idx = real_idx
+                    except:
+                        pass
+        
+        # Gartenfotos filtern
+        garden_photos = [i for i in unique_indices if categories.get(i) in ['GARTEN', 'HAUS', 'SONSTIGES']]
+        
+        return garden_photos, family_photo_idx, list(duplicates)
+        
+    except Exception as e:
+        st.warning(f"Foto-Analyse fehlgeschlagen: {e}. Verwende alle Fotos.")
+        return unique_indices, None, list(duplicates)
 
 
 # --- Adaptive Verarbeitung ---
@@ -264,6 +376,11 @@ def strategy_one_by_one(images, image_names, additional_text="", delay=0):
 def process_adaptive(images, image_names, additional_text="", delay=0):
     num_images = len(images)
     
+    if num_images == 0:
+        if additional_text:
+            return call_gemini_with_retry([EXTRACTION_PROMPT + "\n\n" + additional_text])
+        return None
+    
     if num_images == 1:
         st.info("📤 Verarbeite Dokument...")
         contents = [EXTRACTION_PROMPT, images[0]]
@@ -302,7 +419,7 @@ def process_adaptive(images, image_names, additional_text="", delay=0):
     return result
 
 
-# --- PDF-Erstellung mit Hintergrundbild ---
+# --- Content Parser ---
 
 def parse_content(content):
     """Parst den KI-Output in strukturierte Daten"""
@@ -326,13 +443,13 @@ def parse_content(content):
             continue
         
         # Erste Zeile: FAMILIENNAME|||ORT
-        if '|||' in line:
+        if '|||' in line and data['family_name'] == 'FAMILIE':
             parts = line.split('|||')
             data['family_name'] = parts[0].strip()
             data['city'] = parts[1].strip() if len(parts) > 1 else ''
             continue
         
-        # Section Headers
+        # Section Headers erkennen
         line_upper = line.upper()
         if 'FAMILIENMITGLIEDER' in line_upper:
             current_section = 'members'
@@ -341,8 +458,7 @@ def parse_content(content):
             current_section = 'garden'
             continue
         elif line_upper.startswith('BUDGET'):
-            # Budget direkt extrahieren
-            budget_match = re.search(r'[\d.,]+\s*€?', line)
+            budget_match = re.search(r'[\d.,]+', line)
             if budget_match:
                 data['budget'] = budget_match.group(0).strip()
             current_section = None
@@ -350,7 +466,7 @@ def parse_content(content):
         elif 'WÜNSCHE' in line_upper:
             current_section = 'wishes'
             continue
-        elif 'HINTERGRUND' in line_upper or 'FAMILIE' in line_upper:
+        elif 'HINTERGRUND' in line_upper or ('FAMILIE' in line_upper and '/' in line_upper):
             current_section = 'background'
             continue
         elif 'BESONDERHEITEN' in line_upper or 'NOTIZEN' in line_upper:
@@ -364,9 +480,9 @@ def parse_content(content):
             data['garden_facts'].append(line[1:].strip())
         elif current_section == 'wishes' and line.startswith('-'):
             data['wishes'].append(line[1:].strip())
-        elif current_section == 'background':
+        elif current_section == 'background' and not line.startswith('-'):
             data['background'] += line + ' '
-        elif current_section == 'notes':
+        elif current_section == 'notes' and not line.startswith('-'):
             data['notes'] += line + ' '
     
     data['background'] = data['background'].strip()
@@ -375,237 +491,309 @@ def parse_content(content):
     return data
 
 
-def draw_rounded_rect(c, x, y, width, height, radius, fill_color=None, stroke_color=None, alpha=1):
+# --- PDF-Erstellung ---
+
+def draw_rounded_rect(c, x, y, width, height, radius, fill_color=None, alpha=0.85):
     """Zeichnet ein Rechteck mit abgerundeten Ecken"""
     c.saveState()
     
     if fill_color:
-        if len(fill_color) == 4:  # RGBA
-            c.setFillColorRGB(fill_color[0]/255, fill_color[1]/255, fill_color[2]/255, fill_color[3]/255)
-        else:
-            c.setFillColorRGB(fill_color[0]/255, fill_color[1]/255, fill_color[2]/255, alpha)
+        c.setFillColorRGB(fill_color[0]/255, fill_color[1]/255, fill_color[2]/255, alpha)
     
-    if stroke_color:
-        c.setStrokeColorRGB(stroke_color[0]/255, stroke_color[1]/255, stroke_color[2]/255)
-        c.setLineWidth(1)
-    
-    # Pfad für abgerundetes Rechteck
     p = c.beginPath()
     p.moveTo(x + radius, y)
     p.lineTo(x + width - radius, y)
-    p.arcTo(x + width - radius, y, x + width, y + radius, radius)
+    p.arcTo(x + width - 2*radius, y, x + width, y + 2*radius, 90)
     p.lineTo(x + width, y + height - radius)
-    p.arcTo(x + width, y + height - radius, x + width - radius, y + height, radius)
+    p.arcTo(x + width - 2*radius, y + height - 2*radius, x + width, y + height, 90)
     p.lineTo(x + radius, y + height)
-    p.arcTo(x + radius, y + height, x, y + height - radius, radius)
+    p.arcTo(x, y + height - 2*radius, x + 2*radius, y + height, 90)
     p.lineTo(x, y + radius)
-    p.arcTo(x, y + radius, x + radius, y, radius)
+    p.arcTo(x, y, x + 2*radius, y + 2*radius, 90)
     p.close()
     
-    if fill_color and stroke_color:
-        c.drawPath(p, fill=1, stroke=1)
-    elif fill_color:
-        c.drawPath(p, fill=1, stroke=0)
-    elif stroke_color:
-        c.drawPath(p, fill=0, stroke=1)
-    
+    c.drawPath(p, fill=1, stroke=0)
     c.restoreState()
 
 
-def draw_section_header(c, x, y, text, width=None):
-    """Zeichnet einen Section-Header wie im Entwurf"""
+def draw_section_header(c, x, y, text):
+    """Zeichnet einen Section-Header"""
     c.saveState()
-    
-    # Textbreite berechnen
-    c.setFont("Helvetica-Bold", 11)
-    text_width = c.stringWidth(text, "Helvetica-Bold", 11)
-    box_width = text_width + 16 if width is None else width
-    box_height = 20
+    c.setFont("Helvetica-Bold", 10)
+    text_width = c.stringWidth(text, "Helvetica-Bold", 10)
+    box_width = text_width + 14
+    box_height = 18
     
     # Grüner Hintergrund
-    draw_rounded_rect(c, x, y - box_height + 5, box_width, box_height, 3, 
-                      fill_color=COLORS['section_header_bg'])
+    c.setFillColorRGB(COLORS['section_header_bg'][0]/255, 
+                      COLORS['section_header_bg'][1]/255, 
+                      COLORS['section_header_bg'][2]/255)
+    c.roundRect(x, y - box_height + 4, box_width, box_height, 3, fill=1, stroke=0)
     
     # Weißer Text
     c.setFillColorRGB(1, 1, 1)
-    c.drawString(x + 8, y - 10, text)
+    c.drawString(x + 7, y - 9, text)
     
     c.restoreState()
     return box_height
 
 
-def draw_content_box(c, x, y, width, height, alpha=0.85):
-    """Zeichnet eine weiße, leicht transparente Box"""
-    draw_rounded_rect(c, x, y, width, height, 5, 
-                      fill_color=(255, 255, 255), alpha=alpha)
+def draw_content_box(c, x, y, width, height):
+    """Zeichnet eine weiße transparente Box"""
+    draw_rounded_rect(c, x, y, width, height, 8, fill_color=(255, 255, 255), alpha=0.88)
 
 
-def draw_text_block(c, x, y, lines, font="Helvetica", size=10, line_height=14, color=(51, 51, 51)):
-    """Zeichnet mehrere Textzeilen"""
-    c.saveState()
+def wrap_text(c, text, max_width, font="Helvetica", size=9):
+    """Bricht Text um"""
     c.setFont(font, size)
-    c.setFillColorRGB(color[0]/255, color[1]/255, color[2]/255)
+    words = text.split()
+    lines = []
+    current_line = ""
     
-    current_y = y
-    for line in lines:
-        c.drawString(x, current_y, line)
-        current_y -= line_height
+    for word in words:
+        test_line = current_line + " " + word if current_line else word
+        if c.stringWidth(test_line, font, size) < max_width:
+            current_line = test_line
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+    if current_line:
+        lines.append(current_line)
     
-    c.restoreState()
-    return y - current_y
+    return lines
 
 
-def create_styled_pdf_with_background(content, background_image_path=None):
-    """Erstellt das PDF mit Hintergrundbild wie im Entwurf"""
-    buffer = io.BytesIO()
-    
+def create_pdf_page1(c, data, family_photo=None, background_path=None):
+    """Erstellt Seite 1 des PDFs"""
     width, height = A4
-    c = canvas.Canvas(buffer, pagesize=A4)
     
-    # Daten parsen
-    data = parse_content(content)
-    
-    # --- Hintergrundbild ---
-    if background_image_path and os.path.exists(background_image_path):
+    # Hintergrund
+    if background_path and os.path.exists(background_path):
         try:
-            c.drawImage(background_image_path, 0, 0, width=width, height=height, 
+            c.drawImage(background_path, 0, 0, width=width, height=height, 
                        preserveAspectRatio=False, mask='auto')
         except:
-            pass  # Falls Bild nicht geladen werden kann
+            pass
     
-    # --- Titel im Header-Bereich ---
-    # Position: Im oberen Bereich, unterhalb der Logos
-    title_y = height - 85
+    # --- Titel (Position: unter dem Header, ca. Y=745) ---
+    title_y = height - 97
     title_text = f"EXPOSÉ FAMILIE {data['family_name']} AUS {data['city']}"
     
-    c.setFont("Helvetica-Bold", 18)
+    c.setFont("Helvetica-Bold", 16)
     c.setFillColorRGB(COLORS['title_green'][0]/255, 
                       COLORS['title_green'][1]/255, 
                       COLORS['title_green'][2]/255)
     
-    # Titel zentrieren
-    title_width = c.stringWidth(title_text, "Helvetica-Bold", 18)
+    title_width = c.stringWidth(title_text, "Helvetica-Bold", 16)
     c.drawString((width - title_width) / 2, title_y, title_text)
     
-    # --- Content-Bereich ---
-    margin_left = 25
-    margin_right = 25
+    # --- Layout-Variablen ---
+    margin_left = 20
+    margin_right = 20
     content_width = width - margin_left - margin_right
     
-    current_y = height - 120  # Start unterhalb des Headers
+    # Familienfoto links, Mitglieder rechts
+    photo_width = 120
+    photo_height = 90
+    photo_x = margin_left + 10
+    photo_y = height - 215
     
-    # --- Familienmitglieder ---
+    members_x = margin_left + photo_width + 30
+    members_width = content_width - photo_width - 40
+    
+    current_y = height - 125
+    
+    # --- Familienmitglieder (mit Foto daneben) ---
     if data['members']:
-        box_height = len(data['members']) * 16 + 30
+        box_height = max(len(data['members']) * 14 + 35, photo_height + 20)
+        
+        # Box über gesamte Breite
         draw_content_box(c, margin_left, current_y - box_height, content_width, box_height)
-        draw_section_header(c, margin_left + 5, current_y - 5, "Familienmitglieder:")
         
-        c.setFont("Helvetica", 10)
+        # Familienfoto einfügen
+        if family_photo:
+            try:
+                img_buffer = io.BytesIO()
+                family_photo.save(img_buffer, format='JPEG', quality=85)
+                img_buffer.seek(0)
+                c.drawImage(ImageReader(img_buffer), photo_x, current_y - box_height + 10, 
+                           width=photo_width, height=photo_height, preserveAspectRatio=True)
+                
+                # Rahmen um Foto
+                c.setStrokeColorRGB(0.4, 0.4, 0.4)
+                c.setLineWidth(1)
+                c.rect(photo_x, current_y - box_height + 10, photo_width, photo_height)
+            except:
+                pass
+        
+        # Section Header
+        draw_section_header(c, members_x - 5, current_y - 5, "Familienmitglieder:")
+        
+        # Mitglieder-Liste
+        c.setFont("Helvetica", 9)
         c.setFillColorRGB(0.2, 0.2, 0.2)
-        text_y = current_y - 30
+        text_y = current_y - 28
         for member in data['members']:
-            # Fett-Formatierung für Namen
             member_clean = member.replace('**', '')
-            c.drawString(margin_left + 15, text_y, f"• {member_clean}")
-            text_y -= 16
+            c.drawString(members_x + 5, text_y, f"• {member_clean}")
+            text_y -= 14
         
-        current_y -= box_height + 10
+        current_y -= box_height + 8
     
     # --- Fakten zum Garten ---
     if data['garden_facts'] or data['budget']:
-        facts_lines = data['garden_facts'].copy()
+        facts_lines = []
+        for fact in data['garden_facts']:
+            facts_lines.extend(wrap_text(c, f"• {fact}", content_width - 30))
         if data['budget']:
-            facts_lines.append(f"Budget: {data['budget']} €")
+            facts_lines.append(f"• Budget: {data['budget']} €")
         
-        box_height = len(facts_lines) * 16 + 30
+        box_height = len(facts_lines) * 12 + 30
         draw_content_box(c, margin_left, current_y - box_height, content_width, box_height)
         draw_section_header(c, margin_left + 5, current_y - 5, "Fakten zum Garten:")
         
-        c.setFont("Helvetica", 10)
+        c.setFont("Helvetica", 9)
         c.setFillColorRGB(0.2, 0.2, 0.2)
-        text_y = current_y - 30
-        for fact in facts_lines:
-            c.drawString(margin_left + 15, text_y, f"• {fact}")
-            text_y -= 16
+        text_y = current_y - 28
+        for line in facts_lines:
+            c.drawString(margin_left + 15, text_y, line)
+            text_y -= 12
         
-        current_y -= box_height + 10
+        current_y -= box_height + 8
     
     # --- Wünsche für den Garten ---
     if data['wishes']:
-        box_height = len(data['wishes']) * 16 + 30
+        wish_lines = []
+        for wish in data['wishes']:
+            wish_clean = wish.replace('**', '')
+            wish_lines.extend(wrap_text(c, f"• {wish_clean}", content_width - 30))
+        
+        box_height = len(wish_lines) * 12 + 30
         draw_content_box(c, margin_left, current_y - box_height, content_width, box_height)
         draw_section_header(c, margin_left + 5, current_y - 5, "Wünsche für den Garten:")
         
-        c.setFont("Helvetica", 10)
+        c.setFont("Helvetica", 9)
         c.setFillColorRGB(0.2, 0.2, 0.2)
-        text_y = current_y - 30
-        for wish in data['wishes']:
-            wish_clean = wish.replace('**', '')
-            c.drawString(margin_left + 15, text_y, f"• {wish_clean}")
-            text_y -= 16
+        text_y = current_y - 28
+        for line in wish_lines:
+            c.drawString(margin_left + 15, text_y, line)
+            text_y -= 12
         
-        current_y -= box_height + 10
+        current_y -= box_height + 8
     
     # --- Die Familie / Hintergrund ---
     if data['background']:
-        # Text umbrechen
-        c.setFont("Helvetica", 10)
-        words = data['background'].split()
-        lines = []
-        current_line = ""
-        max_width = content_width - 30
-        
-        for word in words:
-            test_line = current_line + " " + word if current_line else word
-            if c.stringWidth(test_line, "Helvetica", 10) < max_width:
-                current_line = test_line
-            else:
-                if current_line:
-                    lines.append(current_line)
-                current_line = word
-        if current_line:
-            lines.append(current_line)
-        
-        box_height = len(lines) * 14 + 35
+        bg_lines = wrap_text(c, data['background'], content_width - 30)
+        box_height = len(bg_lines) * 12 + 30
         draw_content_box(c, margin_left, current_y - box_height, content_width, box_height)
         draw_section_header(c, margin_left + 5, current_y - 5, "Die Familie / Hintergrund:")
         
+        c.setFont("Helvetica", 9)
         c.setFillColorRGB(0.2, 0.2, 0.2)
-        text_y = current_y - 30
-        for line in lines:
+        text_y = current_y - 28
+        for line in bg_lines:
             c.drawString(margin_left + 15, text_y, line)
-            text_y -= 14
+            text_y -= 12
         
-        current_y -= box_height + 10
+        current_y -= box_height + 8
     
     # --- Besonderheiten / Notizen ---
     if data['notes']:
-        c.setFont("Helvetica", 10)
-        words = data['notes'].split()
-        lines = []
-        current_line = ""
-        max_width = content_width - 30
-        
-        for word in words:
-            test_line = current_line + " " + word if current_line else word
-            if c.stringWidth(test_line, "Helvetica", 10) < max_width:
-                current_line = test_line
-            else:
-                if current_line:
-                    lines.append(current_line)
-                current_line = word
-        if current_line:
-            lines.append(current_line)
-        
-        box_height = len(lines) * 14 + 35
+        notes_lines = wrap_text(c, data['notes'], content_width - 30)
+        box_height = len(notes_lines) * 12 + 30
         draw_content_box(c, margin_left, current_y - box_height, content_width, box_height)
         draw_section_header(c, margin_left + 5, current_y - 5, "Besonderheiten / Notizen:")
         
+        c.setFont("Helvetica", 9)
         c.setFillColorRGB(0.2, 0.2, 0.2)
-        text_y = current_y - 30
-        for line in lines:
+        text_y = current_y - 28
+        for line in notes_lines:
             c.drawString(margin_left + 15, text_y, line)
-            text_y -= 14
+            text_y -= 12
+
+
+def create_pdf_page2(c, photos, photo_names, data, background_path=None):
+    """Erstellt Seite 2 mit Fotos in 2 Spalten"""
+    width, height = A4
+    
+    c.showPage()
+    
+    # Hintergrund
+    if background_path and os.path.exists(background_path):
+        try:
+            c.drawImage(background_path, 0, 0, width=width, height=height, 
+                       preserveAspectRatio=False, mask='auto')
+        except:
+            pass
+    
+    # Titel
+    title_y = height - 97
+    title_text = f"FOTOS - FAMILIE {data['family_name']}"
+    
+    c.setFont("Helvetica-Bold", 16)
+    c.setFillColorRGB(COLORS['title_green'][0]/255, 
+                      COLORS['title_green'][1]/255, 
+                      COLORS['title_green'][2]/255)
+    
+    title_width = c.stringWidth(title_text, "Helvetica-Bold", 16)
+    c.drawString((width - title_width) / 2, title_y, title_text)
+    
+    if not photos:
+        return
+    
+    # 2-spaltiges Layout
+    margin = 25
+    gap = 15
+    col_width = (width - 2 * margin - gap) / 2
+    photo_height = 140
+    
+    start_y = height - 130
+    
+    for i, (photo, name) in enumerate(zip(photos, photo_names)):
+        col = i % 2
+        row = i // 2
+        
+        x = margin + col * (col_width + gap)
+        y = start_y - row * (photo_height + 20)
+        
+        if y < 50:  # Nicht mehr Platz auf der Seite
+            break
+        
+        try:
+            img_buffer = io.BytesIO()
+            photo.save(img_buffer, format='JPEG', quality=85)
+            img_buffer.seek(0)
+            
+            # Weißer Hintergrund für Foto
+            draw_rounded_rect(c, x - 5, y - photo_height - 5, col_width + 10, photo_height + 25, 5, 
+                            fill_color=(255, 255, 255), alpha=0.9)
+            
+            c.drawImage(ImageReader(img_buffer), x, y - photo_height, 
+                       width=col_width, height=photo_height, preserveAspectRatio=True)
+            
+            # Bildname
+            c.setFont("Helvetica", 7)
+            c.setFillColorRGB(0.3, 0.3, 0.3)
+            c.drawString(x, y - photo_height - 12, name[:40])
+            
+        except Exception as e:
+            pass
+
+
+def create_full_pdf(content, family_photo=None, garden_photos=None, photo_names=None, background_path=None):
+    """Erstellt das komplette PDF mit beiden Seiten"""
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    
+    data = parse_content(content)
+    
+    # Seite 1
+    create_pdf_page1(c, data, family_photo, background_path)
+    
+    # Seite 2 (nur wenn Fotos vorhanden)
+    if garden_photos:
+        create_pdf_page2(c, garden_photos, photo_names or [], data, background_path)
     
     c.save()
     buffer.seek(0)
@@ -618,30 +806,43 @@ st.markdown("*Automatische Erstellung von Exposés aus Casting-Unterlagen*")
 
 st.divider()
 
-# --- Schritt 1: Upload ---
+# --- Schritt 1: Upload (3 Felder) ---
 st.header("1️⃣ Unterlagen hochladen")
 
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.subheader("📄 Dokumente & Bilder")
-    uploaded_files = st.file_uploader(
+    st.subheader("📄 Dokumente")
+    doc_files = st.file_uploader(
         "Casting-Bögen, PDFs, Word-Dokumente",
         type=["png", "jpg", "jpeg", "webp", "pdf", "docx"],
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        key="docs",
+        help="Gescannte Formulare, PDFs, Word-Dokumente"
     )
-    
-    if uploaded_files:
-        image_files = [f for f in uploaded_files if f.type.startswith('image/')]
-        pdf_files = [f for f in uploaded_files if f.type == 'application/pdf']
-        docx_files = [f for f in uploaded_files if f.type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document']
-        
-        st.success(f"✅ {len(uploaded_files)} Datei(en)")
-        st.caption(f"📷 {len(image_files)} Bilder | 📄 {len(pdf_files)} PDFs | 📝 {len(docx_files)} Word")
+    if doc_files:
+        st.success(f"✅ {len(doc_files)} Dokument(e)")
 
 with col2:
+    st.subheader("📷 Fotos")
+    photo_files = st.file_uploader(
+        "Fotos von Familie & Garten",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        key="photos",
+        help="Familienfotos und Gartenbilder für das Exposé"
+    )
+    if photo_files:
+        st.success(f"✅ {len(photo_files)} Foto(s)")
+
+with col3:
     st.subheader("📝 Text (optional)")
-    manual_text = st.text_area("E-Mail-Text, Notizen etc.", height=150)
+    manual_text = st.text_area(
+        "Zusätzliche Infos",
+        height=150,
+        placeholder="E-Mail-Text, Notizen, besondere Anweisungen...",
+        help="Wird bei der Analyse berücksichtigt"
+    )
 
 st.divider()
 
@@ -656,39 +857,65 @@ with st.expander("⚙️ Optionen"):
         fallback_delay = st.slider("Pause bei Fallback (Sek.)", 0, 60, 5, 5)
 
 if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True):
-    if not uploaded_files and not manual_text:
+    if not doc_files and not photo_files and not manual_text:
         st.error("Bitte Dateien hochladen oder Text eingeben.")
     else:
         try:
+            # --- Dokumente verarbeiten ---
             extracted_text = manual_text or ""
+            doc_images = []
+            doc_names = []
             
-            for f in uploaded_files:
-                f.seek(0)
-                if f.type == 'application/pdf':
-                    st.text(f"📄 Lese {f.name}...")
-                    extracted_text += "\n\n" + extract_text_from_pdf(f)
-                elif f.type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-                    st.text(f"📝 Lese {f.name}...")
-                    extracted_text += "\n\n" + extract_text_from_docx(f)
+            if doc_files:
+                for f in doc_files:
+                    f.seek(0)
+                    if f.type == 'application/pdf':
+                        st.text(f"📄 Lese {f.name}...")
+                        extracted_text += "\n\n" + extract_text_from_pdf(f)
+                    elif f.type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+                        st.text(f"📝 Lese {f.name}...")
+                        extracted_text += "\n\n" + extract_text_from_docx(f)
+                    elif f.type.startswith('image/'):
+                        img = Image.open(f)
+                        img = compress_image(img, max_size=max_image_size)
+                        doc_images.append(img)
+                        doc_names.append(f.name)
             
-            pil_images = []
-            image_names = []
-            
-            for f in uploaded_files:
-                f.seek(0)
-                if f.type.startswith('image/'):
-                    img = Image.open(f)
-                    img = compress_image(img, max_size=max_image_size)
-                    pil_images.append(img)
-                    image_names.append(f.name)
-            
-            if len(pil_images) == 0 and extracted_text:
-                st.info("📤 Verarbeite Text...")
-                result = call_gemini_with_retry([EXTRACTION_PROMPT + "\n\n" + extracted_text])
-            else:
-                result = process_adaptive(pil_images, image_names, extracted_text, delay=fallback_delay)
+            # --- Text-Extraktion ---
+            st.info("📄 Extrahiere Informationen aus Dokumenten...")
+            result = process_adaptive(doc_images, doc_names, extracted_text, delay=fallback_delay)
             
             st.session_state["extracted_content"] = result
+            
+            # --- Fotos verarbeiten ---
+            if photo_files:
+                st.info("📷 Analysiere Fotos...")
+                
+                all_photos = []
+                all_photo_names = []
+                
+                for f in photo_files:
+                    f.seek(0)
+                    img = Image.open(f)
+                    img = compress_image(img, max_size=1200)  # Höhere Auflösung für Fotos
+                    all_photos.append(img)
+                    all_photo_names.append(f.name)
+                
+                # Foto-Analyse (Kategorisierung & Duplikate)
+                garden_indices, family_idx, duplicate_indices = analyze_photos(all_photos)
+                
+                st.session_state["all_photos"] = all_photos
+                st.session_state["all_photo_names"] = all_photo_names
+                st.session_state["garden_indices"] = garden_indices
+                st.session_state["family_idx"] = family_idx
+                st.session_state["duplicate_indices"] = duplicate_indices
+                
+                if duplicate_indices:
+                    st.warning(f"⚠️ {len(duplicate_indices)} ähnliche/doppelte Fotos erkannt und ausgeblendet.")
+                
+                if family_idx is not None:
+                    st.success(f"✅ Familienfoto erkannt: {all_photo_names[family_idx]}")
+            
             st.success("✅ Analyse abgeschlossen!")
             st.balloons()
             
@@ -697,17 +924,69 @@ if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True
 
 st.divider()
 
-# --- Schritt 3 & 4: Bearbeiten & Export ---
+# --- Schritt 3: Bearbeiten ---
 st.header("3️⃣ Überprüfen & Bearbeiten")
 
 if "extracted_content" in st.session_state:
+    # Text bearbeiten
     edited_content = st.text_area(
-        "Exposé (bearbeitbar):",
+        "Exposé-Text (bearbeitbar):",
         value=st.session_state["extracted_content"],
-        height=400
+        height=350
     )
     
+    # --- Foto-Auswahl ---
+    if "all_photos" in st.session_state and st.session_state["all_photos"]:
+        st.subheader("📷 Foto-Auswahl")
+        
+        all_photos = st.session_state["all_photos"]
+        all_names = st.session_state["all_photo_names"]
+        garden_indices = st.session_state.get("garden_indices", list(range(len(all_photos))))
+        family_idx = st.session_state.get("family_idx")
+        duplicates = st.session_state.get("duplicate_indices", [])
+        
+        # Familienfoto-Auswahl
+        st.markdown("**Familienfoto für Seite 1:**")
+        family_options = ["Kein Familienfoto"] + [f"{i}: {all_names[i]}" for i in range(len(all_photos))]
+        default_family = 0 if family_idx is None else family_idx + 1
+        
+        selected_family = st.selectbox(
+            "Familienfoto auswählen",
+            options=range(len(family_options)),
+            format_func=lambda x: family_options[x],
+            index=default_family
+        )
+        
+        # Gartenfotos-Auswahl
+        st.markdown("**Fotos für Seite 2:**")
+        
+        # Checkboxen für jedes Foto
+        cols = st.columns(4)
+        selected_garden = []
+        
+        for i, (photo, name) in enumerate(zip(all_photos, all_names)):
+            with cols[i % 4]:
+                # Thumbnail anzeigen
+                st.image(photo, width=150, caption=name[:20])
+                
+                # Status anzeigen
+                status = ""
+                if i in duplicates:
+                    status = "🔄 Duplikat"
+                elif i == family_idx:
+                    status = "👨‍👩‍👧 Familie"
+                
+                # Checkbox
+                default_checked = i in garden_indices and i not in duplicates
+                if st.checkbox(f"Verwenden {status}", value=default_checked, key=f"photo_{i}"):
+                    selected_garden.append(i)
+        
+        st.session_state["selected_family_idx"] = selected_family - 1 if selected_family > 0 else None
+        st.session_state["selected_garden_indices"] = selected_garden
+    
     st.divider()
+    
+    # --- Schritt 4: PDF Export ---
     st.header("4️⃣ PDF exportieren")
     
     col1, col2 = st.columns([2, 1])
@@ -719,23 +998,50 @@ if "extracted_content" in st.session_state:
         st.write("")
         if st.button("📥 PDF erstellen", type="primary"):
             try:
-                # Hintergrundbild-Pfad
                 bg_path = "Background.jpg"
                 if not os.path.exists(bg_path):
                     bg_path = None
-                    st.warning("⚠️ Hintergrundbild nicht gefunden. PDF wird ohne Hintergrund erstellt.")
+                    st.warning("⚠️ Hintergrundbild nicht gefunden.")
                 
-                pdf_buffer = create_styled_pdf_with_background(edited_content, bg_path)
+                # Familienfoto
+                family_photo = None
+                if "all_photos" in st.session_state:
+                    family_idx = st.session_state.get("selected_family_idx")
+                    if family_idx is not None and family_idx >= 0:
+                        family_photo = st.session_state["all_photos"][family_idx]
+                
+                # Gartenfotos
+                garden_photos = []
+                garden_names = []
+                if "all_photos" in st.session_state:
+                    selected_indices = st.session_state.get("selected_garden_indices", [])
+                    for idx in selected_indices:
+                        if idx != st.session_state.get("selected_family_idx"):  # Nicht das Familienfoto
+                            garden_photos.append(st.session_state["all_photos"][idx])
+                            garden_names.append(st.session_state["all_photo_names"][idx])
+                
+                pdf_buffer = create_full_pdf(
+                    edited_content, 
+                    family_photo=family_photo,
+                    garden_photos=garden_photos,
+                    photo_names=garden_names,
+                    background_path=bg_path
+                )
+                
                 st.download_button(
                     "⬇️ PDF herunterladen",
                     data=pdf_buffer,
                     file_name=f"{family_name}.pdf",
                     mime="application/pdf"
                 )
+                
             except Exception as e:
                 st.error(f"PDF-Fehler: {str(e)}")
+                import traceback
+                st.code(traceback.format_exc())
     
-    with st.expander("👁️ Parsed Data Preview"):
+    # Debug-Info
+    with st.expander("🔍 Debug: Parsed Data"):
         data = parse_content(edited_content)
         st.json(data)
 
