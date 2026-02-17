@@ -300,7 +300,7 @@ with st.expander("⚙️ Optionen"):
     with col1:
         max_image_size = st.slider("Bildgröße (px)", 512, 1024, 800, 128)
     with col2:
-        image_delay = st.slider("Pause zwischen Bildern (Sek.)", 60, 90, 65)
+        image_delay = st.slider("Pause zwischen Bildern (Sek.)", 60, 120, 70)
 
 if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True):
     if not uploaded_files and not manual_text:
