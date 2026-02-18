@@ -1,9 +1,6 @@
 ## Willkommen beim Casting Exposé Generator!
 
-Dieses Tool hilft dir dabei, aus Casting-Unterlagen automatisch professionelle Exposés zu erstellen.
-
-**Features:**
-
+**FEATURES:**
 - Analysiert eingegebene Castingbögen als Word, PDF oder gescannte Dokumente (Handschrift möglich) und fasst die Inhalte zusammen.
 - Analysiert Fotos, mistet Dopplungen aus und trifft eine Vorauswahl.
 - Im Textfeld können zusätzliche Infos oder Anweisungen (z.B. "Lass die Kinder aus dem Expose") eingegeben werden.
