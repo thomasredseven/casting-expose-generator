@@ -1,9 +1,8 @@
 ## Willkommen beim Casting Exposé Generator!
 
-**FEATURES:**
-- Analysiert eingegebene Castingbögen als Word, PDF oder gescannte Dokumente (Handschrift möglich) und fasst die Inhalte zusammen.
+- Analysiert Castingbögen als Word, PDF oder gescannte Dokumente (Handschrift möglich) und fasst sie zusammen.
 - Analysiert Fotos, mistet Dopplungen aus und trifft eine Vorauswahl.
-- Im Textfeld können zusätzliche Infos oder Anweisungen (z.B. "Lass die Kinder aus dem Expose") eingegeben werden.
+- Im Textfeld können weitere Infos oder Anweisungen (z.B. "Lass die Kinder aus dem Expose") eingegeben werden.
 - Generierte Texte und Bildauswahl können editiert werden.
 - Ausgabe des Exposés als PDF.
 - Re-Import eines Exposé-PDFs zur Editierung.
