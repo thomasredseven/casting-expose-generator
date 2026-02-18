@@ -1,5 +1,5 @@
 # app.py - Casting Exposé Generator v4.2
-# Mit Passwort-Schutz und Beschreibungsbereich
+# Mit Passwort-Schutz und Beschreibungs-Datei
 
 import streamlit as st
 import google.generativeai as genai
@@ -14,51 +14,93 @@ from reportlab.lib.utils import ImageReader
 import fitz
 from docx import Document
 
-# --- Konfiguration ---
+# --- Seiten-Konfiguration ---
 st.set_page_config(
     page_title="Casting Exposé Generator",
     page_icon="🎬",
     layout="wide"
 )
 
-# --- PASSWORT-SCHUTZ ---
+# --- Passwort-Schutz ---
 def check_password():
     """Zeigt Passwort-Dialog und prüft Eingabe"""
     
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
+    # Passwort aus Secrets laden
+    correct_password = st.secrets.get("APP_PASSWORD", "castinggarten")
     
-    if st.session_state["authenticated"]:
+    # Prüfen ob bereits eingeloggt
+    if st.session_state.get("authenticated", False):
         return True
     
-    # Login-Bereich zentriert darstellen
+    # Login-Formular
+    st.markdown("""
+    <style>
+    .login-container {
+        max-width: 400px;
+        margin: 100px auto;
+        padding: 40px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        border-radius: 20px;
+        box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
     col1, col2, col3 = st.columns([1, 2, 1])
     
     with col2:
+        st.markdown("### 🎬 Casting Exposé Generator")
         st.markdown("---")
-        st.markdown("## 🔐 Login erforderlich")
-        st.markdown("Bitte gib das Passwort ein, um fortzufahren.")
+        st.markdown("**Bitte Passwort eingeben:**")
         
-        password = st.text_input("Passwort:", type="password", key="password_input")
+        password = st.text_input(
+            "Passwort",
+            type="password",
+            placeholder="Passwort eingeben...",
+            label_visibility="collapsed"
+        )
         
-        if st.button("Anmelden", type="primary", use_container_width=True):
-            if password == "castinggarten":
+        if st.button("🔓 Anmelden", type="primary", use_container_width=True):
+            if password == correct_password:
                 st.session_state["authenticated"] = True
                 st.rerun()
             else:
-                st.error("❌ Falsches Passwort. Bitte versuche es erneut.")
+                st.error("❌ Falsches Passwort!")
         
         st.markdown("---")
+        st.caption("Bei Fragen wende dich an die Redaktion.")
     
     return False
 
 
-# Passwort prüfen - wenn nicht authentifiziert, hier stoppen
+def load_description():
+    """Lädt die Beschreibung aus der Markdown-Datei"""
+    description_file = "description.md"
+    
+    if os.path.exists(description_file):
+        with open(description_file, "r", encoding="utf-8") as f:
+            return f.read()
+    else:
+        # Fallback-Text wenn Datei nicht existiert
+        return """
+## Willkommen!
+
+Dieses Tool erstellt automatisch Exposés aus Casting-Unterlagen.
+
+**Anleitung:**
+1. Dokumente hochladen
+2. Fotos hinzufügen
+3. KI-Analyse starten
+4. PDF exportieren
+"""
+
+
+# --- Passwort prüfen ---
 if not check_password():
     st.stop()
 
 
-# --- Ab hier nur für authentifizierte User ---
+# --- Ab hier nur für eingeloggte Nutzer ---
 
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 genai.configure(api_key=GEMINI_API_KEY)
@@ -137,6 +179,7 @@ Kurz! Keine Duplikate!
 
 PHOTO_ANALYSIS_PROMPT = "Kategorisiere: NUMMER|KATEGORIE|BESCHREIBUNG. Kategorien: FAMILIE, GARTEN, HAUS, SONSTIGES"
 
+
 # --- Hilfsfunktionen ---
 
 def fix_image_orientation(image):
@@ -176,7 +219,6 @@ def compress_image(image, max_size=800):
 
 
 def crop_to_square(image):
-    """Croppt Bild quadratisch (Mitte)"""
     w, h = image.size
     size = min(w, h)
     left = (w - size) // 2
@@ -424,7 +466,6 @@ def wrap_text(c, text, max_w, font="Helvetica", size=9):
 
 
 def draw_text_with_bold(c, text, x, y):
-    """Zeichnet Text, nur **markierter** Text wird fett"""
     parts = re.split(r'(\*\*[^*]+\*\*)', text)
     cx = x
     for part in parts:
@@ -487,7 +528,6 @@ def create_pdf_page1(c, content, family_photo=None, bg_path=None):
     
     title, blocks = parse_markdown_content(content)
     
-    # Titel - weiter rechts (nach Büschen, ca. X=200)
     c.setFont("Helvetica-Bold", 14)
     c.setFillColorRGB(COLORS['title_green'][0]/255, COLORS['title_green'][1]/255, COLORS['title_green'][2]/255)
     c.drawString(200, h - 122, f"EXPOSÉ FAMILIE {title['name']} AUS {title['city']}")
@@ -593,9 +633,9 @@ def create_full_pdf(content, family_photo=None, garden_photos=None, names=None, 
     return buf
 
 
-# =====================================================
-# UI - HAUPTBEREICH (nur für authentifizierte User)
-# =====================================================
+# ============================================================
+# UI - Hauptanwendung (nur nach Login sichtbar)
+# ============================================================
 
 # --- Header mit Logos ---
 col1, col2, col3 = st.columns([1, 3, 1])
@@ -608,80 +648,66 @@ with col3:
     if os.path.exists("logo_redseven.png"):
         st.image("logo_redseven.png", width=120)
 
+# --- Logout-Button ---
+col_spacer, col_logout = st.columns([6, 1])
+with col_logout:
+    if st.button("🚪 Logout", use_container_width=True):
+        st.session_state["authenticated"] = False
+        st.rerun()
+
 st.divider()
 
-# =====================================================
-# BESCHREIBUNGSBEREICH (zweispaltig)
-# Hier kannst du deinen eigenen Text einfügen!
-# =====================================================
-
+# --- Beschreibung aus Datei laden (2-spaltig) ---
+description = load_description()
 desc_col1, desc_col2 = st.columns(2)
 
+# Beschreibung in zwei Hälften teilen
+desc_lines = description.split('\n')
+mid = len(desc_lines) // 2
+desc_part1 = '\n'.join(desc_lines[:mid])
+desc_part2 = '\n'.join(desc_lines[mid:])
+
 with desc_col1:
-    st.markdown("""
-    ### 📋 Was macht dieses Tool?
-    
-    Hier kannst du deine eigene Beschreibung einfügen.
-    Erkläre zum Beispiel:
-    
-    - Wofür das Tool gedacht ist
-    - Welche Dokumente hochgeladen werden können
-    - Was am Ende herauskommt
-    
-    **Tipp:** Lade Casting-Bögen, Protokolle und Fotos hoch,
-    um automatisch ein professionelles Exposé zu erstellen.
-    """)
+    st.markdown(desc_part1)
 
 with desc_col2:
-    st.markdown("""
-    ### 🚀 So geht's
-    
-    Hier kannst du eine Schritt-für-Schritt-Anleitung einfügen:
-    
-    1. **Dokumente hochladen** – Scans, PDFs, Word-Dateien
-    2. **Fotos hinzufügen** – Familienfotos und Gartenbilder
-    3. **Analyse starten** – KI extrahiert alle Infos
-    4. **Überprüfen & anpassen** – Text bearbeiten
-    5. **PDF exportieren** – Fertiges Exposé herunterladen
-    
-    Bei Fragen wende dich an [dein Kontakt hier].
-    """)
+    st.markdown(desc_part2)
 
 st.divider()
 
-# =====================================================
-# UPLOAD-BEREICH
-# =====================================================
-
+# --- Upload-Bereich ---
 st.header("1️⃣ Unterlagen hochladen")
 
 c1, c2, c3 = st.columns(3)
 with c1:
     st.subheader("📄 Dokumente")
-    doc_files = st.file_uploader("PDFs, Scans, Word", type=["png", "jpg", "jpeg", "webp", "pdf", "docx"], accept_multiple_files=True, key="docs")
+    doc_files = st.file_uploader("PDFs, Scans", type=["png", "jpg", "jpeg", "webp", "pdf", "docx"], accept_multiple_files=True, key="docs")
+    if doc_files:
+        st.success(f"✅ {len(doc_files)} Dokument(e)")
+
 with c2:
     st.subheader("📷 Fotos")
     photo_files = st.file_uploader("Familie & Garten", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True, key="photos")
+    if photo_files:
+        st.success(f"✅ {len(photo_files)} Foto(s)")
+
 with c3:
     st.subheader("📝 Text")
     manual_text = st.text_area("Zusätzliche Infos", height=150)
 
 st.divider()
 
-# =====================================================
-# ANALYSE
-# =====================================================
-
+# --- Analyse ---
 st.header("2️⃣ Analyse")
 
 with st.expander("⚙️ Optionen"):
-    c1, c2 = st.columns(2)
-    max_size = c1.slider("Bildgröße", 512, 1024, 800, 128)
-    delay = c2.slider("Pause (Sek.)", 0, 60, 5, 5)
+    opt_c1, opt_c2 = st.columns(2)
+    max_size = opt_c1.slider("Bildgröße", 512, 1024, 800, 128)
+    delay = opt_c2.slider("Pause (Sek.)", 0, 60, 5, 5)
 
 if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True):
     if not doc_files and not photo_files and not manual_text:
-        st.error("Bitte Dateien hochladen oder Text eingeben.")
+        st.error("Bitte Dateien hochladen.")
     else:
         try:
             text = manual_text or ""
@@ -702,7 +728,7 @@ if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True
             st.session_state["extracted_content"] = result
             
             if photo_files:
-                st.info("📷 Fotos werden analysiert...")
+                st.info("📷 Fotos analysieren...")
                 photos = [compress_image(Image.open(f), 1200) for f in photo_files]
                 names = [f.name for f in photo_files]
                 garden, fam_idx, dups = analyze_photos(photos)
@@ -719,10 +745,7 @@ if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True
 
 st.divider()
 
-# =====================================================
-# BEARBEITEN
-# =====================================================
-
+# --- Bearbeiten ---
 st.header("3️⃣ Überprüfen & Bearbeiten")
 
 if "extracted_content" in st.session_state:
@@ -737,10 +760,9 @@ if "extracted_content" in st.session_state:
         fam_idx = st.session_state.get("family_idx")
         dups = st.session_state.get("duplicate_indices", [])
         
-        # Quadratische Thumbnails
         thumbs = [crop_to_square(p.copy()).resize((80, 80)) for p in photos]
         
-        # Familienfoto-Auswahl mit Bildern
+        # Familienfoto-Auswahl
         st.markdown("**Familienfoto (Seite 1):**")
         sel_fam = st.session_state.get("selected_family_idx", fam_idx)
         
@@ -761,7 +783,7 @@ if "extracted_content" in st.session_state:
                     st.session_state["selected_family_idx"] = i
                     st.rerun()
         
-        # Seite-2-Fotos kompakt
+        # Seite-2-Fotos
         st.markdown("**Fotos für Seite 2:**")
         sel_garden = st.session_state.get("selected_garden_indices", 
                      [i for i in range(len(photos)) if i not in dups and i != fam_idx])
@@ -778,16 +800,13 @@ if "extracted_content" in st.session_state:
     
     st.divider()
     
-    # =====================================================
-    # EXPORT
-    # =====================================================
+    # --- Export ---
+    st.header("4️⃣ Export")
     
-    st.header("4️⃣ PDF exportieren")
+    exp_c1, exp_c2 = st.columns([2, 1])
+    fname = exp_c1.text_input("Dateiname:", "Expose_Familie")
     
-    c1, c2 = st.columns([2, 1])
-    fname = c1.text_input("Dateiname:", "Expose_Familie")
-    
-    with c2:
+    with exp_c2:
         st.write("")
         st.write("")
         if st.button("📥 PDF erstellen", type="primary"):
