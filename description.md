@@ -2,21 +2,19 @@
 
 Dieses Tool hilft dir dabei, aus Casting-Unterlagen automatisch professionelle Exposés zu erstellen.
 
-**So funktioniert's:**
+**Features:**
 
-1. **Dokumente hochladen** – Casting-Bögen, PDFs oder Word-Dokumente
-2. **Fotos hinzufügen** – Familienfotos und Gartenbilder
-3. **KI-Analyse starten** – Die KI extrahiert alle relevanten Informationen
-4. **Überprüfen & Anpassen** – Text und Fotoauswahl bearbeiten
-5. **PDF exportieren** – Fertiges Exposé herunterladen
+- Analysiert eingegebene Castingbögen als Word, PDF oder gescannte Dokumente (Handschrift möglich) und fasst die Inhalte zusammen.
+- Analysiert Fotos, mistet Dopplungen aus und trifft eine Vorauswahl.
+- Im Textfeld können zusätzliche Infos oder Anweisungen (z.B. "Lass die Kinder aus dem Expose") eingegeben werden.
+- Generierte Texte und Bildauswahl können editiert werden.
+- Ausgabe des Exposés als PDF.
+- Re-Import eines Exposé-PDFs zur Editierung.
 
 ---
 
-**Unterstützte Formate:**
-- Dokumente: PDF, Word, PNG, JPG
-- Fotos: PNG, JPG, WEBP
-
-**Tipps:**
-- Je besser die Scan-Qualität, desto besser die Erkennung
-- Handschriftliche Bögen werden automatisch ausgelesen
-- Ähnliche Fotos werden als Duplikate erkannt
+**ACHTUNG - DIES IST EIN REINER TESTLAUF**
+- Es läuft mit kostenlosen Tools und ist (mit Passwort) für jeden nutzbar.
+- Die Daten werden nicht online gespeichert.
+- Verknüpft mit Free-Version von Gemini-AI. Kann daher etwas langsam oder manchmal nicht verfügbar sein.
+- Aktuell erfolgt Upload auf US-Server (datenschutzrechtlich bedenklich). Wir können auf eine EU-Variante wechseln, die monatlich kostet.
