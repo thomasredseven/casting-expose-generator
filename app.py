@@ -1,5 +1,5 @@
-# app.py - Casting Exposé Generator v4.1
-# Fixes: Fett nur markiert, Titel rechts, kompakte Foto-Auswahl mit Squares
+# app.py - Casting Exposé Generator v4.2
+# Mit Passwort-Schutz und Beschreibungsbereich
 
 import streamlit as st
 import google.generativeai as genai
@@ -20,6 +20,45 @@ st.set_page_config(
     page_icon="🎬",
     layout="wide"
 )
+
+# --- PASSWORT-SCHUTZ ---
+def check_password():
+    """Zeigt Passwort-Dialog und prüft Eingabe"""
+    
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+    
+    if st.session_state["authenticated"]:
+        return True
+    
+    # Login-Bereich zentriert darstellen
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        st.markdown("---")
+        st.markdown("## 🔐 Login erforderlich")
+        st.markdown("Bitte gib das Passwort ein, um fortzufahren.")
+        
+        password = st.text_input("Passwort:", type="password", key="password_input")
+        
+        if st.button("Anmelden", type="primary", use_container_width=True):
+            if password == "castinggarten":
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("❌ Falsches Passwort. Bitte versuche es erneut.")
+        
+        st.markdown("---")
+    
+    return False
+
+
+# Passwort prüfen - wenn nicht authentifiziert, hier stoppen
+if not check_password():
+    st.stop()
+
+
+# --- Ab hier nur für authentifizierte User ---
 
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 genai.configure(api_key=GEMINI_API_KEY)
@@ -554,8 +593,11 @@ def create_full_pdf(content, family_photo=None, garden_photos=None, names=None, 
     return buf
 
 
-# --- UI ---
+# =====================================================
+# UI - HAUPTBEREICH (nur für authentifizierte User)
+# =====================================================
 
+# --- Header mit Logos ---
 col1, col2, col3 = st.columns([1, 3, 1])
 with col1:
     if os.path.exists("logo_ddg.png"):
@@ -567,12 +609,56 @@ with col3:
         st.image("logo_redseven.png", width=120)
 
 st.divider()
+
+# =====================================================
+# BESCHREIBUNGSBEREICH (zweispaltig)
+# Hier kannst du deinen eigenen Text einfügen!
+# =====================================================
+
+desc_col1, desc_col2 = st.columns(2)
+
+with desc_col1:
+    st.markdown("""
+    ### 📋 Was macht dieses Tool?
+    
+    Hier kannst du deine eigene Beschreibung einfügen.
+    Erkläre zum Beispiel:
+    
+    - Wofür das Tool gedacht ist
+    - Welche Dokumente hochgeladen werden können
+    - Was am Ende herauskommt
+    
+    **Tipp:** Lade Casting-Bögen, Protokolle und Fotos hoch,
+    um automatisch ein professionelles Exposé zu erstellen.
+    """)
+
+with desc_col2:
+    st.markdown("""
+    ### 🚀 So geht's
+    
+    Hier kannst du eine Schritt-für-Schritt-Anleitung einfügen:
+    
+    1. **Dokumente hochladen** – Scans, PDFs, Word-Dateien
+    2. **Fotos hinzufügen** – Familienfotos und Gartenbilder
+    3. **Analyse starten** – KI extrahiert alle Infos
+    4. **Überprüfen & anpassen** – Text bearbeiten
+    5. **PDF exportieren** – Fertiges Exposé herunterladen
+    
+    Bei Fragen wende dich an [dein Kontakt hier].
+    """)
+
+st.divider()
+
+# =====================================================
+# UPLOAD-BEREICH
+# =====================================================
+
 st.header("1️⃣ Unterlagen hochladen")
 
 c1, c2, c3 = st.columns(3)
 with c1:
     st.subheader("📄 Dokumente")
-    doc_files = st.file_uploader("PDFs, Scans", type=["png", "jpg", "jpeg", "webp", "pdf", "docx"], accept_multiple_files=True, key="docs")
+    doc_files = st.file_uploader("PDFs, Scans, Word", type=["png", "jpg", "jpeg", "webp", "pdf", "docx"], accept_multiple_files=True, key="docs")
 with c2:
     st.subheader("📷 Fotos")
     photo_files = st.file_uploader("Familie & Garten", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True, key="photos")
@@ -581,6 +667,11 @@ with c3:
     manual_text = st.text_area("Zusätzliche Infos", height=150)
 
 st.divider()
+
+# =====================================================
+# ANALYSE
+# =====================================================
+
 st.header("2️⃣ Analyse")
 
 with st.expander("⚙️ Optionen"):
@@ -588,9 +679,9 @@ with st.expander("⚙️ Optionen"):
     max_size = c1.slider("Bildgröße", 512, 1024, 800, 128)
     delay = c2.slider("Pause (Sek.)", 0, 60, 5, 5)
 
-if st.button("🔍 KI-Analyse", type="primary", use_container_width=True):
+if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True):
     if not doc_files and not photo_files and not manual_text:
-        st.error("Bitte Dateien hochladen.")
+        st.error("Bitte Dateien hochladen oder Text eingeben.")
     else:
         try:
             text = manual_text or ""
@@ -611,7 +702,7 @@ if st.button("🔍 KI-Analyse", type="primary", use_container_width=True):
             st.session_state["extracted_content"] = result
             
             if photo_files:
-                st.info("📷 Fotos...")
+                st.info("📷 Fotos werden analysiert...")
                 photos = [compress_image(Image.open(f), 1200) for f in photo_files]
                 names = [f.name for f in photo_files]
                 garden, fam_idx, dups = analyze_photos(photos)
@@ -621,13 +712,18 @@ if st.button("🔍 KI-Analyse", type="primary", use_container_width=True):
                     "garden_indices": garden, "family_idx": fam_idx, "duplicate_indices": dups
                 })
             
-            st.success("✅ Fertig!")
+            st.success("✅ Analyse abgeschlossen!")
             st.balloons()
         except Exception as e:
             st.error(f"Fehler: {e}")
 
 st.divider()
-st.header("3️⃣ Bearbeiten")
+
+# =====================================================
+# BEARBEITEN
+# =====================================================
+
+st.header("3️⃣ Überprüfen & Bearbeiten")
 
 if "extracted_content" in st.session_state:
     st.caption("Format: `# Name | Ort`, `## Section`, `- Aufzählung`, `**fett**`")
@@ -681,7 +777,12 @@ if "extracted_content" in st.session_state:
         st.session_state["selected_garden_indices"] = new_sel
     
     st.divider()
-    st.header("4️⃣ Export")
+    
+    # =====================================================
+    # EXPORT
+    # =====================================================
+    
+    st.header("4️⃣ PDF exportieren")
     
     c1, c2 = st.columns([2, 1])
     fname = c1.text_input("Dateiname:", "Expose_Familie")
@@ -689,7 +790,7 @@ if "extracted_content" in st.session_state:
     with c2:
         st.write("")
         st.write("")
-        if st.button("📥 PDF", type="primary"):
+        if st.button("📥 PDF erstellen", type="primary"):
             bg = "Background.jpg" if os.path.exists("Background.jpg") else None
             
             fam_photo = None
@@ -709,7 +810,7 @@ if "extracted_content" in st.session_state:
             st.download_button("⬇️ Download", pdf, f"{fname}.pdf", "application/pdf")
 
 else:
-    st.info("👆 Erst analysieren.")
+    st.info("👆 Erst Unterlagen hochladen und Analyse starten.")
 
 st.divider()
-st.caption("🔒 Daten nur temporär.")
+st.caption("🔒 Daten werden nur temporär verarbeitet und nicht gespeichert.")
