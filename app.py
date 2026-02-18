@@ -1,5 +1,5 @@
-# app.py - Casting Exposé Generator v4.2
-# Mit Passwort-Schutz und Beschreibungs-Datei
+# app.py - Casting Exposé Generator v5.0
+# Mit PDF Re-Import (Metadaten + eingebettete Fotos)
 
 import streamlit as st
 import google.generativeai as genai
@@ -8,109 +8,61 @@ import io
 import time
 import re
 import os
+import json
+import base64
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 import fitz
 from docx import Document
 
-# --- Seiten-Konfiguration ---
-st.set_page_config(
-    page_title="Casting Exposé Generator",
-    page_icon="🎬",
-    layout="wide"
-)
-
-# --- Passwort-Schutz ---
-def check_password():
-    """Zeigt Passwort-Dialog und prüft Eingabe"""
-    
-    # Passwort aus Secrets laden
-    correct_password = st.secrets.get("APP_PASSWORD", "castinggarten")
-    
-    # Prüfen ob bereits eingeloggt
-    if st.session_state.get("authenticated", False):
-        return True
-    
-    # Login-Formular
-    st.markdown("""
-    <style>
-    .login-container {
-        max-width: 400px;
-        margin: 100px auto;
-        padding: 40px;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        border-radius: 20px;
-        box-shadow: 0 10px 40px rgba(0,0,0,0.3);
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    col1, col2, col3 = st.columns([1, 2, 1])
-    
-    with col2:
-        st.markdown("### 🎬 Casting Exposé Generator")
-        st.markdown("---")
-        st.markdown("**Bitte Passwort eingeben:**")
-        
-        password = st.text_input(
-            "Passwort",
-            type="password",
-            placeholder="Passwort eingeben...",
-            label_visibility="collapsed"
-        )
-        
-        if st.button("🔓 Anmelden", type="primary", use_container_width=True):
-            if password == correct_password:
-                st.session_state["authenticated"] = True
-                st.rerun()
-            else:
-                st.error("❌ Falsches Passwort!")
-        
-        st.markdown("---")
-        st.caption("Bei Fragen wende dich an die Redaktion.")
-    
-    return False
-
-
-def load_description():
-    """Lädt die Beschreibung aus der Markdown-Datei"""
-    description_file = "description.md"
-    
-    if os.path.exists(description_file):
-        with open(description_file, "r", encoding="utf-8") as f:
-            return f.read()
-    else:
-        # Fallback-Text wenn Datei nicht existiert
-        return """
-## Willkommen!
-
-Dieses Tool erstellt automatisch Exposés aus Casting-Unterlagen.
-
-**Anleitung:**
-1. Dokumente hochladen
-2. Fotos hinzufügen
-3. KI-Analyse starten
-4. PDF exportieren
-"""
-
-
-# --- Passwort prüfen ---
-if not check_password():
-    st.stop()
-
-
-# --- Ab hier nur für eingeloggte Nutzer ---
-
-GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-3-flash-preview")
+# --- Konfiguration ---
+st.set_page_config(page_title="Casting Exposé Generator", page_icon="🎬", layout="wide")
 
 COLORS = {
     'title_green': (78, 124, 35),
     'section_header_bg': (101, 148, 58),
     'text_dark': (51, 51, 51),
 }
+
+APP_VERSION = "5.0"
+PDF_MARKER = "CASTING_EXPOSE_GENERATOR"
+
+
+# --- Passwort ---
+def check_password():
+    correct = st.secrets.get("APP_PASSWORD", "castinggarten")
+    if st.session_state.get("authenticated"):
+        return True
+    
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        st.markdown("### 🎬 Casting Exposé Generator")
+        st.markdown("---")
+        pw = st.text_input("Passwort", type="password", placeholder="Passwort...")
+        if st.button("🔓 Anmelden", type="primary", use_container_width=True):
+            if pw == correct:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("❌ Falsches Passwort!")
+    return False
+
+
+def load_description():
+    if os.path.exists("description.md"):
+        with open("description.md", "r", encoding="utf-8") as f:
+            return f.read()
+    return "## Willkommen!\nDieses Tool erstellt Exposés aus Casting-Unterlagen."
+
+
+if not check_password():
+    st.stop()
+
+# --- Gemini Setup ---
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-3-flash-preview")
 
 # --- Prompts ---
 EXTRACTION_PROMPT = """
@@ -139,12 +91,7 @@ Kurzer Fließtext über die Familie.
 ## Notizen
 Termine, Besonderheiten (nur wenn vorhanden)
 
-REGELN:
-- Erste Zeile: # FAMILIENNAME | ORT
-- Sections mit ##
-- Namen **fett**
-- Kurz und knackig
-- Deutsch
+REGELN: Erste Zeile # NAME | ORT, Sections ##, Namen **fett**, kurz, Deutsch.
 """
 
 SINGLE_IMAGE_PROMPT = "Extrahiere alle Informationen. Kurz, stichpunktartig, Deutsch."
@@ -155,24 +102,12 @@ Kombiniere zu EINEM Exposé im MARKDOWN-FORMAT:
 {extracted_infos}
 
 # FAMILIENNAME | ORT
-
 ## Familienmitglieder
-- **Name** (Alter), Beruf
-
 ## Fakten zum Garten
-- Stichpunkte
-
 ## Budget
-X.XXX €
-
 ## Wünsche für den Garten
-- Liste
-
 ## Die Familie
-Fließtext
-
 ## Notizen
-Falls relevant
 
 Kurz! Keine Duplikate!
 """
@@ -180,28 +115,29 @@ Kurz! Keine Duplikate!
 PHOTO_ANALYSIS_PROMPT = "Kategorisiere: NUMMER|KATEGORIE|BESCHREIBUNG. Kategorien: FAMILIE, GARTEN, HAUS, SONSTIGES"
 
 
-# --- Hilfsfunktionen ---
+# =============================================================
+# Hilfsfunktionen
+# =============================================================
 
 def fix_image_orientation(image):
     try:
         exif = image._getexif()
         if not exif:
             return image
-        
         for key, value in ExifTags.TAGS.items():
             if value == 'Orientation':
-                orientation = exif.get(key, 1)
-                rotations = {
-                    2: lambda img: img.transpose(Image.FLIP_LEFT_RIGHT),
-                    3: lambda img: img.rotate(180, expand=True),
-                    4: lambda img: img.transpose(Image.FLIP_TOP_BOTTOM),
-                    5: lambda img: img.transpose(Image.FLIP_LEFT_RIGHT).rotate(270, expand=True),
-                    6: lambda img: img.rotate(270, expand=True),
-                    7: lambda img: img.transpose(Image.FLIP_LEFT_RIGHT).rotate(90, expand=True),
-                    8: lambda img: img.rotate(90, expand=True),
+                o = exif.get(key, 1)
+                ops = {
+                    2: lambda i: i.transpose(Image.FLIP_LEFT_RIGHT),
+                    3: lambda i: i.rotate(180, expand=True),
+                    4: lambda i: i.transpose(Image.FLIP_TOP_BOTTOM),
+                    5: lambda i: i.transpose(Image.FLIP_LEFT_RIGHT).rotate(270, expand=True),
+                    6: lambda i: i.rotate(270, expand=True),
+                    7: lambda i: i.transpose(Image.FLIP_LEFT_RIGHT).rotate(90, expand=True),
+                    8: lambda i: i.rotate(90, expand=True),
                 }
-                if orientation in rotations:
-                    return rotations[orientation](image)
+                if o in ops:
+                    return ops[o](image)
                 break
         return image
     except:
@@ -221,9 +157,19 @@ def compress_image(image, max_size=800):
 def crop_to_square(image):
     w, h = image.size
     size = min(w, h)
-    left = (w - size) // 2
-    top = (h - size) // 2
+    left, top = (w - size) // 2, (h - size) // 2
     return image.crop((left, top, left + size, top + size))
+
+
+def image_to_bytes(image, fmt='JPEG', quality=85):
+    buf = io.BytesIO()
+    image.save(buf, format=fmt, quality=quality)
+    buf.seek(0)
+    return buf.read()
+
+
+def bytes_to_image(data):
+    return Image.open(io.BytesIO(data))
 
 
 def get_image_hash(image, hash_size=8):
@@ -235,12 +181,12 @@ def get_image_hash(image, hash_size=8):
 
 def find_duplicates(images, threshold=10):
     hashes = [get_image_hash(img) for img in images]
-    duplicates = set()
+    dups = set()
     for i in range(len(hashes)):
         for j in range(i + 1, len(hashes)):
             if sum(a != b for a, b in zip(hashes[i], hashes[j])) < threshold:
-                duplicates.add(j)
-    return duplicates
+                dups.add(j)
+    return dups
 
 
 def extract_text_from_pdf(pdf_file):
@@ -254,13 +200,12 @@ def extract_text_from_docx(docx_file):
     return "\n".join(para.text for para in Document(docx_file).paragraphs)
 
 
-def wait_with_countdown(seconds, message="Warte"):
+def wait_with_countdown(seconds, msg="Warte"):
     if seconds <= 0:
         return
-    bar = st.progress(0)
-    txt = st.empty()
+    bar, txt = st.progress(0), st.empty()
     for i in range(seconds):
-        txt.text(f"⏱️ {message}... {seconds - i}s")
+        txt.text(f"⏱️ {msg}... {seconds - i}s")
         bar.progress((i + 1) / seconds)
         time.sleep(1)
     txt.empty()
@@ -294,15 +239,11 @@ def call_gemini_with_retry(contents, retries=3):
 def analyze_photos(images):
     if not images:
         return [], None, []
-    
-    duplicates = find_duplicates(images)
-    unique = [i for i in range(len(images)) if i not in duplicates]
-    
+    dups = find_duplicates(images)
+    unique = [i for i in range(len(images)) if i not in dups]
     try:
         resp = call_gemini_with_retry([PHOTO_ANALYSIS_PROMPT] + [images[i] for i in unique])
-        categories = {}
-        family_idx = None
-        
+        cats, fam = {}, None
         for line in resp.strip().split('\n'):
             if '|' in line:
                 parts = line.split('|')
@@ -310,48 +251,44 @@ def analyze_photos(images):
                     idx = int(parts[0].strip()) - 1
                     cat = parts[1].strip().upper()
                     if idx < len(unique):
-                        real_idx = unique[idx]
-                        categories[real_idx] = cat
-                        if cat == 'FAMILIE' and family_idx is None:
-                            family_idx = real_idx
+                        ri = unique[idx]
+                        cats[ri] = cat
+                        if cat == 'FAMILIE' and fam is None:
+                            fam = ri
                 except:
                     pass
-        
-        garden = [i for i in unique if categories.get(i) != 'FAMILIE']
-        return garden, family_idx, list(duplicates)
+        garden = [i for i in unique if cats.get(i) != 'FAMILIE']
+        return garden, fam, list(dups)
     except:
-        return unique, None, list(duplicates)
+        return unique, None, list(dups)
 
 
 def process_adaptive(images, names, text="", delay=0):
     n = len(images)
-    
     if n == 0:
         return call_gemini_with_retry([EXTRACTION_PROMPT + "\n\n" + text]) if text else None
-    
     if n == 1:
         st.info("📤 Verarbeite...")
-        contents = [EXTRACTION_PROMPT, images[0]]
+        c = [EXTRACTION_PROMPT, images[0]]
         if text:
-            contents.append(f"\n\nZusatzinfos:\n{text}")
-        return call_gemini_with_retry(contents)
+            c.append(f"\n\nZusatzinfos:\n{text}")
+        return call_gemini_with_retry(c)
     
     st.info(f"🚀 Stufe 1: Alle {n} Dokumente...")
     try:
-        contents = [EXTRACTION_PROMPT]
+        c = [EXTRACTION_PROMPT]
         if text:
-            contents.append(f"\n\nZusatzinfos:\n{text}\n\n")
-        contents.extend(["Dokumente:"] + images)
-        return call_gemini(contents)
+            c.append(f"\n\nZusatzinfos:\n{text}\n\n")
+        c.extend(["Dokumente:"] + images)
+        return call_gemini(c)
     except Exception as e:
         if is_rate_limit_error(e):
-            st.warning("⚠️ Stufe 2...")
             wait_with_countdown(min(get_retry_delay(e), 30))
         else:
             raise
     
     if n > 3:
-        st.info("📦 Stufe 2: Batches...")
+        st.info("📦 Stufe 2...")
         try:
             parts = []
             for i in range(0, n, 3):
@@ -360,19 +297,17 @@ def process_adaptive(images, names, text="", delay=0):
                     parts.append(r)
                 if delay:
                     wait_with_countdown(delay)
-            
-            all_info = "\n\n".join(parts)
+            ai = "\n\n".join(parts)
             if text:
-                all_info = f"Zusatzinfos:\n{text}\n\n{all_info}"
-            return call_gemini_with_retry([COMBINE_PROMPT.format(extracted_infos=all_info)])
+                ai = f"Zusatzinfos:\n{text}\n\n{ai}"
+            return call_gemini_with_retry([COMBINE_PROMPT.format(extracted_infos=ai)])
         except Exception as e:
             if is_rate_limit_error(e):
-                st.warning("⚠️ Stufe 3...")
                 wait_with_countdown(min(get_retry_delay(e), 30))
             else:
                 raise
     
-    st.info("🐢 Stufe 3: Einzeln...")
+    st.info("🐢 Stufe 3...")
     parts = []
     for img in images:
         r = call_gemini_with_retry([SINGLE_IMAGE_PROMPT, img])
@@ -380,55 +315,49 @@ def process_adaptive(images, names, text="", delay=0):
             parts.append(r)
         if delay:
             wait_with_countdown(max(delay, 5))
-    
-    all_info = "\n\n".join(parts)
+    ai = "\n\n".join(parts)
     if text:
-        all_info = f"Zusatzinfos:\n{text}\n\n{all_info}"
-    return call_gemini_with_retry([COMBINE_PROMPT.format(extracted_infos=all_info)])
+        ai = f"Zusatzinfos:\n{text}\n\n{ai}"
+    return call_gemini_with_retry([COMBINE_PROMPT.format(extracted_infos=ai)])
 
 
-# --- Markdown Parser ---
+# =============================================================
+# Markdown Parser
+# =============================================================
 
 def parse_markdown_content(content):
-    blocks = []
-    title = {'name': 'FAMILIE', 'city': 'ORT'}
-    current = None
-    
+    blocks, title, current = [], {'name': 'FAMILIE', 'city': 'ORT'}, None
     for line in content.strip().split('\n'):
         line = line.strip()
         if not line or line == '---':
             continue
-        
         if line.startswith('# ') and not line.startswith('## '):
             txt = line[2:].strip()
             if '|' in txt:
-                parts = txt.split('|')
-                title['name'] = parts[0].strip()
-                title['city'] = parts[1].strip() if len(parts) > 1 else ''
+                p = txt.split('|')
+                title['name'] = p[0].strip()
+                title['city'] = p[1].strip() if len(p) > 1 else ''
             else:
                 title['name'] = txt
             continue
-        
         if line.startswith('## '):
             if current:
                 blocks.append(current)
             current = {'type': 'section', 'title': line[3:].strip(), 'items': []}
             continue
-        
         if (line.startswith('- ') or line.startswith('* ')) and current:
             current['items'].append({'type': 'bullet', 'text': line[2:].strip()})
             continue
-        
         if current:
             current['items'].append({'type': 'text', 'text': line})
-    
     if current:
         blocks.append(current)
-    
     return title, blocks
 
 
-# --- PDF Erstellung ---
+# =============================================================
+# PDF Erstellung
+# =============================================================
 
 def draw_rounded_rect(c, x, y, w, h, r, color, alpha=0.88):
     c.saveState()
@@ -451,17 +380,17 @@ def draw_section_header(c, x, y, text):
 def wrap_text(c, text, max_w, font="Helvetica", size=9):
     c.setFont(font, size)
     words = text.split()
-    lines, current = [], ""
+    lines, cur = [], ""
     for word in words:
-        test = current + " " + word if current else word
+        test = cur + " " + word if cur else word
         if c.stringWidth(test, font, size) < max_w:
-            current = test
+            cur = test
         else:
-            if current:
-                lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
+            if cur:
+                lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
     return lines
 
 
@@ -484,9 +413,7 @@ def draw_text_with_bold(c, text, x, y):
 
 
 def calc_block_height(c, block, w):
-    lines = 0
-    for item in block['items']:
-        lines += len(wrap_text(c, item['text'].replace('**', ''), w - 35))
+    lines = sum(len(wrap_text(c, it['text'].replace('**', ''), w - 35)) for it in block['items'])
     return 34 + lines * 13 + 10
 
 
@@ -494,23 +421,20 @@ def draw_block(c, block, x, y, w):
     h = calc_block_height(c, block, w)
     draw_rounded_rect(c, x, y - h, w, h, 8, (255, 255, 255), 0.88)
     draw_section_header(c, x + 5, y - 5, block['title'] + ":")
-    
     ty = y - 36
     c.setFillColorRGB(0.2, 0.2, 0.2)
-    
     for item in block['items']:
-        text = item['text']
         if item['type'] == 'bullet':
-            wrapped = wrap_text(c, text.replace('**', ''), w - 35)
+            wrapped = wrap_text(c, item['text'].replace('**', ''), w - 35)
             for i, line in enumerate(wrapped):
                 if i == 0:
-                    draw_text_with_bold(c, "• " + text, x + 15, ty)
+                    draw_text_with_bold(c, "• " + item['text'], x + 15, ty)
                 else:
                     c.setFont("Helvetica", 9)
                     c.drawString(x + 25, ty, line)
                 ty -= 13
         else:
-            for line in wrap_text(c, text, w - 30):
+            for line in wrap_text(c, item['text'], w - 30):
                 c.setFont("Helvetica", 9)
                 c.drawString(x + 15, ty, line)
                 ty -= 13
@@ -519,7 +443,6 @@ def draw_block(c, block, x, y, w):
 
 def create_pdf_page1(c, content, family_photo=None, bg_path=None):
     w, h = A4
-    
     if bg_path and os.path.exists(bg_path):
         try:
             c.drawImage(bg_path, 0, 0, width=w, height=h, preserveAspectRatio=False, mask='auto')
@@ -527,20 +450,15 @@ def create_pdf_page1(c, content, family_photo=None, bg_path=None):
             pass
     
     title, blocks = parse_markdown_content(content)
-    
     c.setFont("Helvetica-Bold", 14)
     c.setFillColorRGB(COLORS['title_green'][0]/255, COLORS['title_green'][1]/255, COLORS['title_green'][2]/255)
     c.drawString(200, h - 122, f"EXPOSÉ FAMILIE {title['name']} AUS {title['city']}")
     
-    margin = 20
-    cw = w - margin * 2
+    margin, cw = 20, w - 40
     cy = h - 145
-    
-    photo_w = (cw / 2) - 10
-    photo_h = 120
+    photo_w, photo_h = (cw / 2) - 10, 120
     
     first = blocks[0] if blocks else None
-    
     if first and 'mitglieder' in first['title'].lower():
         bh = max(calc_block_height(c, first, cw / 2), photo_h + 20)
         draw_rounded_rect(c, margin, cy - bh, cw, bh, 8, (255, 255, 255), 0.88)
@@ -556,14 +474,12 @@ def create_pdf_page1(c, content, family_photo=None, bg_path=None):
         
         mx = margin + photo_w + 20
         draw_section_header(c, mx, cy - 5, first['title'] + ":")
-        
         ty = cy - 36
         c.setFillColorRGB(0.2, 0.2, 0.2)
         for item in first['items']:
             if item['type'] == 'bullet':
                 draw_text_with_bold(c, "• " + item['text'], mx + 5, ty)
                 ty -= 14
-        
         cy -= bh + 8
         blocks = blocks[1:]
     
@@ -580,7 +496,6 @@ def create_pdf_page1(c, content, family_photo=None, bg_path=None):
 def create_pdf_page2(c, photos, names, content, bg_path=None):
     w, h = A4
     c.showPage()
-    
     if bg_path and os.path.exists(bg_path):
         try:
             c.drawImage(bg_path, 0, 0, width=w, height=h, preserveAspectRatio=False, mask='auto')
@@ -588,7 +503,6 @@ def create_pdf_page2(c, photos, names, content, bg_path=None):
             pass
     
     title, _ = parse_markdown_content(content)
-    
     c.setFont("Helvetica-Bold", 14)
     c.setFillColorRGB(COLORS['title_green'][0]/255, COLORS['title_green'][1]/255, COLORS['title_green'][2]/255)
     c.drawString(200, h - 122, f"FOTOS - FAMILIE {title['name']}")
@@ -597,18 +511,14 @@ def create_pdf_page2(c, photos, names, content, bg_path=None):
         return
     
     margin, gap = 25, 15
-    col_w = (w - 2 * margin - gap) / 2
-    ph = 160
+    col_w, ph = (w - 2 * margin - gap) / 2, 160
     sy = h - 150
     
     for i, (photo, name) in enumerate(zip(photos, names)):
         col, row = i % 2, i // 2
-        x = margin + col * (col_w + gap)
-        y = sy - row * (ph + 30)
-        
+        x, y = margin + col * (col_w + gap), sy - row * (ph + 30)
         if y < 80:
             break
-        
         try:
             buf = io.BytesIO()
             fix_image_orientation(photo).save(buf, format='JPEG', quality=90)
@@ -622,22 +532,167 @@ def create_pdf_page2(c, photos, names, content, bg_path=None):
             pass
 
 
-def create_full_pdf(content, family_photo=None, garden_photos=None, names=None, bg_path=None):
+# =============================================================
+# PDF Export MIT eingebetteten Projektdaten
+# =============================================================
+
+def create_full_pdf(content, family_photo=None, garden_photos=None, 
+                    photo_names=None, bg_path=None,
+                    family_photo_name=None, all_photo_data=None):
+    """
+    Erstellt PDF mit eingebetteten Projektdaten.
+    
+    all_photo_data: Liste von dicts mit {'name': str, 'bytes': bytes, 'is_family': bool, 'selected': bool}
+    """
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
+    
     create_pdf_page1(c, content, family_photo, bg_path)
     if garden_photos:
-        create_pdf_page2(c, garden_photos, names or [], content, bg_path)
+        create_pdf_page2(c, garden_photos, photo_names or [], content, bg_path)
+    
     c.save()
     buf.seek(0)
-    return buf
+    
+    # --- Projektdaten in PDF einbetten ---
+    doc = fitz.open(stream=buf.read(), filetype="pdf")
+    
+    # 1. Markdown-Content als Metadaten
+    project_meta = {
+        "marker": PDF_MARKER,
+        "version": APP_VERSION,
+        "markdown": content,
+        "family_photo_name": family_photo_name or "",
+        "photo_count": len(all_photo_data) if all_photo_data else 0,
+        "created": time.strftime("%Y-%m-%d %H:%M")
+    }
+    
+    # Metadaten setzen
+    doc.set_metadata({
+        "author": "Casting Exposé Generator",
+        "subject": json.dumps(project_meta, ensure_ascii=False),
+        "title": f"Exposé - {parse_markdown_content(content)[0]['name']}"
+    })
+    
+    # 2. Fotos als Attachments einbetten
+    if all_photo_data:
+        # Photo-Index als JSON
+        photo_index = []
+        for pd in all_photo_data:
+            photo_index.append({
+                "name": pd["name"],
+                "is_family": pd.get("is_family", False),
+                "selected": pd.get("selected", True)
+            })
+        
+        # Index-Datei einbetten
+        index_bytes = json.dumps(photo_index, ensure_ascii=False).encode('utf-8')
+        doc.embfile_add("photo_index.json", index_bytes, 
+                       filename="photo_index.json", 
+                       desc="Foto-Index für Re-Import")
+        
+        # Jedes Foto einbetten
+        for pd in all_photo_data:
+            doc.embfile_add(
+                pd["name"], 
+                pd["bytes"],
+                filename=pd["name"],
+                desc=f"{'Familienfoto' if pd.get('is_family') else 'Foto'}: {pd['name']}"
+            )
+    
+    # Fertiges PDF ausgeben
+    output = io.BytesIO()
+    doc.save(output)
+    doc.close()
+    output.seek(0)
+    return output
 
 
-# ============================================================
-# UI - Hauptanwendung (nur nach Login sichtbar)
-# ============================================================
+# =============================================================
+# PDF Import (Re-Edit)
+# =============================================================
 
-# --- Header mit Logos ---
+def import_from_pdf(pdf_file):
+    """
+    Importiert Projektdaten aus einer generierten PDF.
+    Gibt zurück: (markdown_content, photos_list, photo_names, family_idx)
+    """
+    pdf_bytes = pdf_file.read()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    
+    # 1. Metadaten lesen
+    metadata = doc.metadata
+    subject = metadata.get("subject", "")
+    
+    try:
+        project_meta = json.loads(subject)
+    except:
+        doc.close()
+        return None, None, None, None
+    
+    # Prüfen ob es eine Exposé-PDF ist
+    if project_meta.get("marker") != PDF_MARKER:
+        doc.close()
+        return None, None, None, None
+    
+    markdown_content = project_meta.get("markdown", "")
+    family_photo_name = project_meta.get("family_photo_name", "")
+    
+    # 2. Fotos aus Attachments extrahieren
+    photos = []
+    photo_names = []
+    family_idx = None
+    
+    # Photo-Index laden
+    photo_index = []
+    try:
+        if "photo_index.json" in doc.embfile_names():
+            index_bytes = doc.embfile_get("photo_index.json")
+            photo_index = json.loads(index_bytes.decode('utf-8'))
+    except:
+        pass
+    
+    # Fotos extrahieren
+    for i, pi in enumerate(photo_index):
+        name = pi["name"]
+        try:
+            if name in doc.embfile_names():
+                img_bytes = doc.embfile_get(name)
+                img = Image.open(io.BytesIO(img_bytes))
+                photos.append(img)
+                photo_names.append(name)
+                
+                if pi.get("is_family", False):
+                    family_idx = len(photos) - 1
+        except:
+            pass
+    
+    doc.close()
+    
+    return markdown_content, photos, photo_names, family_idx
+
+
+def is_expose_pdf(pdf_file):
+    """Prüft ob eine PDF von unserem Generator stammt"""
+    try:
+        pdf_bytes = pdf_file.read()
+        pdf_file.seek(0)  # Reset für späteren Gebrauch
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        meta = doc.metadata
+        doc.close()
+        
+        subject = meta.get("subject", "")
+        data = json.loads(subject)
+        return data.get("marker") == PDF_MARKER
+    except:
+        return False
+
+
+# =============================================================
+# UI
+# =============================================================
+
+# Header
 col1, col2, col3 = st.columns([1, 3, 1])
 with col1:
     if os.path.exists("logo_ddg.png"):
@@ -648,8 +703,8 @@ with col3:
     if os.path.exists("logo_redseven.png"):
         st.image("logo_redseven.png", width=120)
 
-# --- Logout-Button ---
-col_spacer, col_logout = st.columns([6, 1])
+# Logout
+_, col_logout = st.columns([6, 1])
 with col_logout:
     if st.button("🚪 Logout", use_container_width=True):
         st.session_state["authenticated"] = False
@@ -657,40 +712,77 @@ with col_logout:
 
 st.divider()
 
-# --- Beschreibung aus Datei laden (2-spaltig) ---
-description = load_description()
-desc_col1, desc_col2 = st.columns(2)
-
-# Beschreibung in zwei Hälften teilen
-desc_lines = description.split('\n')
+# Beschreibung
+desc = load_description()
+desc_lines = desc.split('\n')
 mid = len(desc_lines) // 2
-desc_part1 = '\n'.join(desc_lines[:mid])
-desc_part2 = '\n'.join(desc_lines[mid:])
-
-with desc_col1:
-    st.markdown(desc_part1)
-
-with desc_col2:
-    st.markdown(desc_part2)
+dc1, dc2 = st.columns(2)
+dc1.markdown('\n'.join(desc_lines[:mid]))
+dc2.markdown('\n'.join(desc_lines[mid:]))
 
 st.divider()
 
-# --- Upload-Bereich ---
-st.header("1️⃣ Unterlagen hochladen")
+# =============================================================
+# Import-Bereich (NEU)
+# =============================================================
+st.header("📂 Bestehendes Exposé bearbeiten")
+
+import_col1, import_col2 = st.columns([3, 1])
+
+with import_col1:
+    import_file = st.file_uploader(
+        "Exportierte Exposé-PDF zum Bearbeiten laden",
+        type=["pdf"],
+        key="import_pdf",
+        help="Laden Sie eine zuvor exportierte PDF, um sie zu bearbeiten."
+    )
+
+with import_col2:
+    st.write("")
+    st.write("")
+    if import_file and st.button("📥 PDF importieren", type="secondary", use_container_width=True):
+        # Prüfen ob es unsere PDF ist
+        if is_expose_pdf(import_file):
+            import_file.seek(0)
+            md_content, imp_photos, imp_names, imp_fam_idx = import_from_pdf(import_file)
+            
+            if md_content:
+                st.session_state["extracted_content"] = md_content
+                
+                if imp_photos:
+                    st.session_state["all_photos"] = imp_photos
+                    st.session_state["all_photo_names"] = imp_names
+                    st.session_state["family_idx"] = imp_fam_idx
+                    st.session_state["selected_family_idx"] = imp_fam_idx
+                    st.session_state["duplicate_indices"] = []
+                    st.session_state["garden_indices"] = [i for i in range(len(imp_photos)) if i != imp_fam_idx]
+                    st.session_state["selected_garden_indices"] = [i for i in range(len(imp_photos)) if i != imp_fam_idx]
+                
+                st.success(f"✅ Importiert! Text + {len(imp_photos) if imp_photos else 0} Fotos wiederhergestellt.")
+                st.rerun()
+            else:
+                st.error("Konnte keine Daten aus der PDF extrahieren.")
+        else:
+            st.error("❌ Diese PDF wurde nicht mit dem Exposé Generator erstellt.")
+
+st.divider()
+
+# =============================================================
+# Upload-Bereich
+# =============================================================
+st.header("1️⃣ Neues Exposé erstellen")
 
 c1, c2, c3 = st.columns(3)
 with c1:
     st.subheader("📄 Dokumente")
     doc_files = st.file_uploader("PDFs, Scans", type=["png", "jpg", "jpeg", "webp", "pdf", "docx"], accept_multiple_files=True, key="docs")
     if doc_files:
-        st.success(f"✅ {len(doc_files)} Dokument(e)")
-
+        st.success(f"✅ {len(doc_files)}")
 with c2:
     st.subheader("📷 Fotos")
     photo_files = st.file_uploader("Familie & Garten", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True, key="photos")
     if photo_files:
-        st.success(f"✅ {len(photo_files)} Foto(s)")
-
+        st.success(f"✅ {len(photo_files)}")
 with c3:
     st.subheader("📝 Text")
     manual_text = st.text_area("Zusätzliche Infos", height=150)
@@ -701,9 +793,9 @@ st.divider()
 st.header("2️⃣ Analyse")
 
 with st.expander("⚙️ Optionen"):
-    opt_c1, opt_c2 = st.columns(2)
-    max_size = opt_c1.slider("Bildgröße", 512, 1024, 800, 128)
-    delay = opt_c2.slider("Pause (Sek.)", 0, 60, 5, 5)
+    oc1, oc2 = st.columns(2)
+    max_size = oc1.slider("Bildgröße", 512, 1024, 800, 128)
+    delay = oc2.slider("Pause (Sek.)", 0, 60, 5, 5)
 
 if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True):
     if not doc_files and not photo_files and not manual_text:
@@ -711,8 +803,7 @@ if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True
     else:
         try:
             text = manual_text or ""
-            doc_imgs, doc_names = [], []
-            
+            di, dn = [], []
             if doc_files:
                 for f in doc_files:
                     f.seek(0)
@@ -721,24 +812,24 @@ if st.button("🔍 KI-Analyse starten", type="primary", use_container_width=True
                     elif 'word' in f.type:
                         text += "\n\n" + extract_text_from_docx(f)
                     elif f.type.startswith('image/'):
-                        doc_imgs.append(compress_image(Image.open(f), max_size))
-                        doc_names.append(f.name)
+                        di.append(compress_image(Image.open(f), max_size))
+                        dn.append(f.name)
             
-            result = process_adaptive(doc_imgs, doc_names, text, delay)
+            result = process_adaptive(di, dn, text, delay)
             st.session_state["extracted_content"] = result
             
             if photo_files:
-                st.info("📷 Fotos analysieren...")
+                st.info("📷 Fotos...")
                 photos = [compress_image(Image.open(f), 1200) for f in photo_files]
                 names = [f.name for f in photo_files]
-                garden, fam_idx, dups = analyze_photos(photos)
-                
+                garden, fam, dups = analyze_photos(photos)
                 st.session_state.update({
                     "all_photos": photos, "all_photo_names": names,
-                    "garden_indices": garden, "family_idx": fam_idx, "duplicate_indices": dups
+                    "garden_indices": garden, "family_idx": fam, "duplicate_indices": dups,
+                    "selected_garden_indices": garden
                 })
             
-            st.success("✅ Analyse abgeschlossen!")
+            st.success("✅ Fertig!")
             st.balloons()
         except Exception as e:
             st.error(f"Fehler: {e}")
@@ -754,47 +845,45 @@ if "extracted_content" in st.session_state:
     
     if "all_photos" in st.session_state:
         st.subheader("📷 Fotos")
-        
         photos = st.session_state["all_photos"]
         names = st.session_state["all_photo_names"]
         fam_idx = st.session_state.get("family_idx")
         dups = st.session_state.get("duplicate_indices", [])
-        
         thumbs = [crop_to_square(p.copy()).resize((80, 80)) for p in photos]
         
-        # Familienfoto-Auswahl
+        # Familienfoto
         st.markdown("**Familienfoto (Seite 1):**")
         sel_fam = st.session_state.get("selected_family_idx", fam_idx)
         
         fam_cols = st.columns(min(len(photos) + 1, 8))
         with fam_cols[0]:
             st.image(Image.new('RGB', (80, 80), (50, 50, 50)), width=80, caption="Keins")
-            if st.button("✓" if sel_fam is None else "○", key="fam_none"):
+            if st.button("✓" if sel_fam is None else "○", key="fn"):
                 st.session_state["selected_family_idx"] = None
                 st.rerun()
         
-        for i, (thumb, name) in enumerate(zip(thumbs, names)):
-            col_i = (i + 1) % 8
-            if col_i == 0 and i > 0:
+        for i, (th, nm) in enumerate(zip(thumbs, names)):
+            ci = (i + 1) % 8
+            if ci == 0 and i > 0:
                 fam_cols = st.columns(8)
-            with fam_cols[col_i]:
-                st.image(thumb, width=80, caption=name[:8])
-                if st.button("✓" if sel_fam == i else "○", key=f"fam_{i}"):
+            with fam_cols[ci]:
+                st.image(th, width=80, caption=nm[:8])
+                if st.button("✓" if sel_fam == i else "○", key=f"f_{i}"):
                     st.session_state["selected_family_idx"] = i
                     st.rerun()
         
         # Seite-2-Fotos
         st.markdown("**Fotos für Seite 2:**")
-        sel_garden = st.session_state.get("selected_garden_indices", 
-                     [i for i in range(len(photos)) if i not in dups and i != fam_idx])
+        sel_g = st.session_state.get("selected_garden_indices", 
+                [i for i in range(len(photos)) if i not in dups and i != fam_idx])
         
         cols = st.columns(6)
         new_sel = []
-        for i, (thumb, name) in enumerate(zip(thumbs, names)):
+        for i, (th, nm) in enumerate(zip(thumbs, names)):
             with cols[i % 6]:
-                st.image(thumb, width=90)
-                status = "🔄" if i in dups else ("👨‍👩‍👧" if i == sel_fam else "")
-                if st.checkbox(status or "✓", value=i in sel_garden, key=f"s_{i}", disabled=i in dups or i == sel_fam):
+                st.image(th, width=90)
+                s = "🔄" if i in dups else ("👨‍👩‍👧" if i == sel_fam else "")
+                if st.checkbox(s or "✓", value=i in sel_g, key=f"s_{i}", disabled=i in dups or i == sel_fam):
                     new_sel.append(i)
         st.session_state["selected_garden_indices"] = new_sel
     
@@ -803,33 +892,64 @@ if "extracted_content" in st.session_state:
     # --- Export ---
     st.header("4️⃣ Export")
     
-    exp_c1, exp_c2 = st.columns([2, 1])
-    fname = exp_c1.text_input("Dateiname:", "Expose_Familie")
+    ec1, ec2 = st.columns([2, 1])
+    fname = ec1.text_input("Dateiname:", "Expose_Familie")
     
-    with exp_c2:
+    with ec2:
         st.write("")
         st.write("")
         if st.button("📥 PDF erstellen", type="primary"):
-            bg = "Background.jpg" if os.path.exists("Background.jpg") else None
-            
-            fam_photo = None
-            if "all_photos" in st.session_state:
-                fidx = st.session_state.get("selected_family_idx")
-                if fidx is not None and fidx >= 0:
-                    fam_photo = st.session_state["all_photos"][fidx]
-            
-            garden_photos, garden_names = [], []
-            if "all_photos" in st.session_state:
-                for idx in st.session_state.get("selected_garden_indices", []):
-                    if idx != st.session_state.get("selected_family_idx"):
-                        garden_photos.append(st.session_state["all_photos"][idx])
-                        garden_names.append(st.session_state["all_photo_names"][idx])
-            
-            pdf = create_full_pdf(edited, fam_photo, garden_photos, garden_names, bg)
-            st.download_button("⬇️ Download", pdf, f"{fname}.pdf", "application/pdf")
+            try:
+                bg = "Background.jpg" if os.path.exists("Background.jpg") else None
+                
+                # Familienfoto
+                fam_photo = None
+                fam_photo_name = None
+                sel_fam = st.session_state.get("selected_family_idx")
+                
+                if "all_photos" in st.session_state and sel_fam is not None and sel_fam >= 0:
+                    fam_photo = st.session_state["all_photos"][sel_fam]
+                    fam_photo_name = st.session_state["all_photo_names"][sel_fam]
+                
+                # Gartenfotos
+                gp, gn = [], []
+                if "all_photos" in st.session_state:
+                    for idx in st.session_state.get("selected_garden_indices", []):
+                        if idx != sel_fam:
+                            gp.append(st.session_state["all_photos"][idx])
+                            gn.append(st.session_state["all_photo_names"][idx])
+                
+                # Alle Fotos für Einbettung vorbereiten
+                all_photo_data = []
+                if "all_photos" in st.session_state:
+                    for i, (photo, name) in enumerate(zip(
+                        st.session_state["all_photos"], 
+                        st.session_state["all_photo_names"]
+                    )):
+                        img_bytes = image_to_bytes(photo, quality=85)
+                        all_photo_data.append({
+                            "name": name,
+                            "bytes": img_bytes,
+                            "is_family": i == sel_fam,
+                            "selected": i in st.session_state.get("selected_garden_indices", [])
+                        })
+                
+                pdf = create_full_pdf(
+                    edited, fam_photo, gp, gn, bg,
+                    family_photo_name=fam_photo_name,
+                    all_photo_data=all_photo_data
+                )
+                
+                st.download_button("⬇️ PDF herunterladen", pdf, f"{fname}.pdf", "application/pdf")
+                st.info("💾 Projektdaten sind in der PDF eingebettet. Sie können diese PDF später wieder importieren.")
+                
+            except Exception as e:
+                st.error(f"Fehler: {e}")
+                import traceback
+                st.code(traceback.format_exc())
 
 else:
-    st.info("👆 Erst Unterlagen hochladen und Analyse starten.")
+    st.info("👆 Neues Exposé erstellen oder bestehendes PDF importieren.")
 
 st.divider()
-st.caption("🔒 Daten werden nur temporär verarbeitet und nicht gespeichert.")
+st.caption("🔒 Daten werden nur temporär verarbeitet. | v" + APP_VERSION)
